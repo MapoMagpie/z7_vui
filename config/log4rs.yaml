@@ -1,0 +1,19 @@
+refresh_rate: 10 seconds
+appenders:
+  stdout:
+    kind: console
+  requests:
+    kind: file
+    path: "log/requests.log"
+    encoder:
+      pattern: "{d} - {m}{n}"
+root:
+  level: info
+  appenders:
+    - requests
+loggers:
+  app::requests:
+    level: info
+    appenders:
+      - requests
+    additive: false
