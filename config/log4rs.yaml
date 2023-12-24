@@ -10,6 +10,7 @@ appenders:
 root:
   level: info
   appenders:
+    # - stdout
     - requests
 loggers:
   app::requests:
