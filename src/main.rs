@@ -3,6 +3,7 @@ use z7::{Operation, Pushment, Z7};
 
 use crate::nvim::Nvim;
 mod nvim;
+mod output_format;
 mod z7;
 
 #[tokio::main]

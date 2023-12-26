@@ -96,13 +96,13 @@ impl Handler for NeovimHandler {
                     .oper_sender
                     .try_send(Operation::Password("test".to_string()));
             }
-            // "nvim_execute_event" => {
-            //     info!("handle_notify: name: {}, args: {:?}", name, args);
-            //     // nvim.quit_no_save().await.expect("quit nvim error");
-            //     nvim.quit_no_save().await.expect("quit nvim error");
-            // }
-            "nvim_vim_leave_event" => {
+            "nvim_execute_event" => {
+                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // nvim.quit_no_save().await.expect("quit nvim error");
                 let _ = self.oper_sender.send(Operation::Execute).await;
+            }
+            "nvim_vim_leave_event" => {
+                // let _ = self.oper_sender.send(Operation::Execute).await;
                 info!("handle_notify: name: {}, args: {:?}", name, args);
             }
             _ => {
@@ -182,14 +182,14 @@ impl Nvim {
         nvim.set_keymap(
             "n",
             "cc",
-            r#":qa!<CR>"#,
+            r#":call rpcnotify(0, "nvim_execute_event")<CR>"#,
             vec![("silent".into(), true.into())],
         )
         .await
         .expect("set keymap error");
-        // nvim.subscribe("nvim_execute_event")
-        //     .await
-        //     .expect("subscribe execute event failed");
+        nvim.subscribe("nvim_execute_event")
+            .await
+            .expect("subscribe execute event failed");
 
         // receive pushment from 7z, then push to nvim
         let wait_push = async move {
@@ -224,6 +224,7 @@ impl Nvim {
                     error!("join error: {:?}", e);
                 }
             }
+            // return error, then other task will be canceled
             Result::<(), ()>::Err(())
         };
 

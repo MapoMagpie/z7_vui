@@ -1,11 +1,4 @@
-use std::{
-    ffi::OsStr,
-    io::{stdout, ErrorKind},
-    ops::Deref,
-    process::Stdio,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{ffi::OsStr, io::ErrorKind, process::Stdio, sync::Arc};
 
 use log::{error, info};
 use ropey::Rope;
@@ -18,6 +11,8 @@ use tokio::{
     },
     try_join,
 };
+
+use crate::output_format::Document;
 
 #[derive(Debug)]
 pub enum Pushment {
@@ -39,7 +34,7 @@ pub enum Cmd {
 }
 
 pub struct Z7 {
-    document: Arc<RwLock<Rope>>,
+    document: Arc<RwLock<Document>>,
     doc_sender: mpsc::Sender<Pushment>,
     password: Arc<RwLock<Option<String>>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
@@ -48,9 +43,8 @@ pub struct Z7 {
 
 impl Z7 {
     pub fn new(pusher: mpsc::Sender<Pushment>) -> Self {
-        let rope = Rope::new();
         Self {
-            document: Arc::new(RwLock::new(rope)),
+            document: Arc::new(RwLock::new(Document::new())),
             doc_sender: pusher,
             password: Arc::new(RwLock::new(None)),
             stdin_pipe: Arc::new(RwLock::new(None)),
@@ -149,42 +143,42 @@ impl Z7 {
 async fn read_document(
     mut opt_recv: mpsc::Receiver<Option<String>>,
     doc_sender: mpsc::Sender<Pushment>,
-    doc: Arc<RwLock<Rope>>,
+    doc: Arc<RwLock<Document>>,
     need_password: Arc<RwLock<bool>>,
 ) -> tokio::io::Result<()> {
     while let Some(line) = opt_recv.recv().await {
         match line {
-            Some(mut line) => {
+            Some(line) => {
                 info!("recv output: {}", line);
-                line.push('\n');
                 {
                     let mut doc = doc.write().await;
-                    doc.append(line.clone().into());
+                    doc.input(line.as_str());
                 }
                 if line.starts_with("Enter password") {
                     let mut np = need_password.write().await;
                     *np = true;
                     let lines = {
                         let doc = doc.read().await;
-                        doc.lines()
-                            .map(|l| l.to_string().trim_end().to_string())
-                            .collect()
+                        doc.output()
                     };
-                    let _ = doc_sender.send(Pushment::Full(lines)).await;
+                    if let Err(e) = doc_sender.send(Pushment::Full(lines)).await {
+                        info!("pushment sender error: {}", e);
+                        return Err(ErrorKind::Interrupted.into());
+                    }
                 }
             }
             // "None" means a command is finished, but we still wait for other commands output
             None => {
                 let lines = {
                     let mut doc = doc.write().await;
-                    let lines = doc
-                        .lines()
-                        .map(|l| l.to_string().trim_end().to_string())
-                        .collect();
-                    doc.remove(0..);
+                    let lines = doc.output();
+                    doc.clear();
                     lines
                 };
-                let _ = doc_sender.send(Pushment::Full(lines)).await;
+                if let Err(e) = doc_sender.send(Pushment::Full(lines)).await {
+                    info!("pushment sender error: {}", e);
+                    return Err(ErrorKind::Interrupted.into());
+                }
             }
         }
     }
@@ -249,7 +243,7 @@ async fn execute_list(
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Arc<RwLock<Option<String>>>,
 ) -> tokio::io::Result<()> {
-    let mut args: Vec<String> = vec!["x".to_string(), filename.to_string(), "-y".to_string()];
+    let mut args: Vec<String> = vec!["l".to_string(), filename.to_string()];
     {
         let pwd = password.read().await;
         if let Some(pwd) = pwd.as_ref() {
@@ -265,7 +259,7 @@ async fn execute_list(
 
 async fn execute_extract(
     filename: &str,
-    _opt_sender: mpsc::Sender<Option<String>>,
+    opt_sender: mpsc::Sender<Option<String>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Arc<RwLock<Option<String>>>,
 ) -> tokio::io::Result<()> {
@@ -276,11 +270,11 @@ async fn execute_extract(
             args.push(format!("-p{}", pwd));
         }
     }
-    let (stdin, _, mut child) = spawn_cmd(args, Some(stdout().into()))?;
+    let (stdin, stdout, _) = spawn_cmd(args, None)?;
     // set stdin to Z7.stdin_pipe
     stdin_pipe.write().await.replace(stdin.unwrap());
-    let _ = child.wait().await;
-    Ok(())
+
+    read_output(stdout.unwrap(), opt_sender).await
 }
 
 async fn read_output(
@@ -298,6 +292,10 @@ async fn read_output(
                         .await
                         .expect("send string line error");
                     str.clear();
+                }
+                // '\b' backspace
+                else if c == 0x08 {
+                    info!("read output has backspace");
                 }
                 // ':'
                 else if c == 0x3a && str.starts_with("Enter password") {

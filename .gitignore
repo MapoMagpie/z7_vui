@@ -3,3 +3,5 @@ Cargo.lock
 test*
 /log
 nvimlog
+/boxed_macro/target
+/boxed_macro/Cargo.lock
