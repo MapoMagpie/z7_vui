@@ -1,10 +1,10 @@
 use std::{ffi::OsStr, io::ErrorKind, process::Stdio, sync::Arc};
 
 use log::{error, info};
-use ropey::Rope;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{ChildStderr, ChildStdin, ChildStdout, Command},
+    select,
     sync::{
         mpsc::{self},
         RwLock,
@@ -12,11 +12,12 @@ use tokio::{
     try_join,
 };
 
-use crate::output_format::Document;
+use crate::output_format::{Document, Lines, PASSWORD_LINE};
 
 #[derive(Debug)]
 pub enum Pushment {
-    Full(Vec<String>),
+    // the option is (col, row), for nvim cursor
+    Full(Vec<String>, Option<(usize, usize)>),
     Line(u64, String),
     None,
 }
@@ -25,6 +26,7 @@ pub enum Pushment {
 pub enum Operation {
     Password(String),
     Execute,
+    Retry,
 }
 
 #[derive(Debug)]
@@ -83,10 +85,24 @@ impl Z7 {
                         return Err(ErrorKind::BrokenPipe.into());
                     }
                 }
+                Operation::Retry => {
+                    {
+                        let mut password = self.password.write().await;
+                        password.take();
+                    }
+                    if let Err(e) = cmd_sender.send(Cmd::List).await {
+                        error!("send cmd error: {}", e);
+                        return Err(ErrorKind::BrokenPipe.into());
+                    }
+                }
                 Operation::Password(pwd) => {
                     {
                         let mut password = self.password.write().await;
                         password.replace(pwd.clone());
+                    }
+                    {
+                        let mut doc = self.document.write().await;
+                        doc.input(format!("Input password: {}", pwd).as_str());
                     }
                     self.write_password(&pwd).await;
                 }
@@ -106,9 +122,10 @@ impl Z7 {
         let stdin_pipe = self.stdin_pipe.clone();
         let password = self.password.clone();
 
+        let doc = self.document.clone();
         match try_join!(
             self.operation_make(cmd_sender, oper_recv),
-            executing_cmd(cmd_recv, opt_sender, stdin_pipe, password),
+            executing_cmd(cmd_recv, opt_sender, stdin_pipe, password, doc),
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
@@ -161,7 +178,10 @@ async fn read_document(
                         let doc = doc.read().await;
                         doc.output()
                     };
-                    if let Err(e) = doc_sender.send(Pushment::Full(lines)).await {
+                    if let Err(e) = doc_sender
+                        .send(Pushment::Full(lines, Some((PASSWORD_LINE, 1))))
+                        .await
+                    {
                         info!("pushment sender error: {}", e);
                         return Err(ErrorKind::Interrupted.into());
                     }
@@ -170,12 +190,10 @@ async fn read_document(
             // "None" means a command is finished, but we still wait for other commands output
             None => {
                 let lines = {
-                    let mut doc = doc.write().await;
-                    let lines = doc.output();
-                    doc.clear();
-                    lines
+                    let doc = doc.read().await;
+                    doc.output()
                 };
-                if let Err(e) = doc_sender.send(Pushment::Full(lines)).await {
+                if let Err(e) = doc_sender.send(Pushment::Full(lines, None)).await {
                     info!("pushment sender error: {}", e);
                     return Err(ErrorKind::Interrupted.into());
                 }
@@ -193,6 +211,7 @@ async fn executing_cmd(
     opt_sender: mpsc::Sender<Option<String>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Arc<RwLock<Option<String>>>,
+    document: Arc<RwLock<Document>>,
 ) -> tokio::io::Result<()> {
     while let Some(cmd) = cmd_recv.recv().await {
         let password = password.clone();
@@ -201,10 +220,20 @@ async fn executing_cmd(
         let stdin_pipe = stdin_pipe.clone();
         match cmd {
             Cmd::List => {
+                {
+                    let mut doc = document.write().await;
+                    doc.layout_list();
+                }
                 execute_list("test.7z", opt_sender, stdin_pipe, password).await?;
+                info!("command list finished");
             }
             Cmd::Extract => {
+                {
+                    let mut doc = document.write().await;
+                    doc.layout_extract();
+                }
                 execute_extract("test.7z", opt_sender, stdin_pipe, password).await?;
+                info!("command extract finished");
             }
         }
     }
@@ -214,27 +243,18 @@ async fn executing_cmd(
 
 fn spawn_cmd<I>(
     args: I,
-    stdout: Option<Stdio>,
-) -> tokio::io::Result<(Option<ChildStdin>, Option<ChildStdout>, Child)>
+) -> tokio::io::Result<(Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>)>
 where
     I: IntoIterator,
     I::Item: AsRef<OsStr>,
 {
-    let is_stdout_some = stdout.is_some();
     let mut child = Command::new("7z")
         .args(args)
         .stdin(Stdio::piped())
-        .stdout(stdout.unwrap_or(Stdio::piped()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
-    Ok((
-        child.stdin.take(),
-        if is_stdout_some {
-            None
-        } else {
-            child.stdout.take()
-        },
-        child,
-    ))
+    Ok((child.stdin.take(), child.stdout.take(), child.stderr.take()))
 }
 
 async fn execute_list(
@@ -250,11 +270,11 @@ async fn execute_list(
             args.push(format!("-p{}", pwd));
         }
     }
-    let (stdin, stdout, _) = spawn_cmd(args, None)?;
+    let (stdin, stdout, stderr) = spawn_cmd(args)?;
     // set stdin to Z7.stdin_pipe
     stdin_pipe.write().await.replace(stdin.unwrap());
 
-    read_output(stdout.unwrap(), opt_sender).await
+    read_output(stdout.unwrap(), stderr.unwrap(), opt_sender.clone()).await
 }
 
 async fn execute_extract(
@@ -270,43 +290,50 @@ async fn execute_extract(
             args.push(format!("-p{}", pwd));
         }
     }
-    let (stdin, stdout, _) = spawn_cmd(args, None)?;
+    let (stdin, stdout, stderr) = spawn_cmd(args)?;
     // set stdin to Z7.stdin_pipe
     stdin_pipe.write().await.replace(stdin.unwrap());
 
-    read_output(stdout.unwrap(), opt_sender).await
+    read_output(stdout.unwrap(), stderr.unwrap(), opt_sender.clone()).await
 }
 
-async fn read_output(
-    mut stdout: ChildStdout,
+async fn read_output<O, E>(
+    stdout: O,
+    stderr: E,
     opt_sender: mpsc::Sender<Option<String>>,
-) -> tokio::io::Result<()> {
-    let mut str = String::new();
+) -> tokio::io::Result<()>
+where
+    O: AsyncReadExt + Unpin,
+    E: AsyncReadExt + Unpin,
+{
+    let mut reader = OutputReader::new(stdout, stderr);
+    // stdout , stderr
+    let mut str = [String::new(), String::new()];
     loop {
-        match stdout.read_u8().await {
-            Ok(c) => {
-                // '\n'
+        match reader.read().await {
+            Ok((c, from)) => {
+                // 'LF'
                 if c == 0x0a {
                     opt_sender
-                        .send(Some(str.clone()))
+                        .send(Some(str[from].clone()))
                         .await
                         .expect("send string line error");
-                    str.clear();
+                    str[from].clear();
                 }
-                // '\b' backspace
+                // '\b' backspace, actually someone eat them
                 else if c == 0x08 {
                     info!("read output has backspace");
                 }
                 // ':'
-                else if c == 0x3a && str.starts_with("Enter password") {
-                    str.push(c as char);
+                else if c == 0x3a && str[from].starts_with("Enter password") {
+                    str[from].push(c as char);
                     opt_sender
-                        .send(Some(str.clone()))
+                        .send(Some(str[from].clone()))
                         .await
                         .expect("send string line error");
-                    str.clear();
+                    str[from].clear();
                 } else {
-                    str.push(c as char);
+                    str[from].push(c as char);
                     // info!("read output: {}", str);
                 }
             }
@@ -322,4 +349,46 @@ async fn read_output(
         }
     }
     Ok(())
+}
+
+/// read the stdout and stderr from child process
+/// hold EOF one of them, util both of them are EOF
+struct OutputReader<O, E> {
+    stdout: O,
+    stderr: E,
+    eof: [bool; 2],
+}
+
+impl<O, E> OutputReader<O, E> {
+    fn new(stdout: O, stderr: E) -> Self {
+        Self {
+            stdout,
+            stderr,
+            eof: [false; 2],
+        }
+    }
+}
+
+impl<O, E> OutputReader<O, E>
+where
+    O: AsyncReadExt + Unpin,
+    E: AsyncReadExt + Unpin,
+{
+    async fn read(&mut self) -> tokio::io::Result<(u8, usize)> {
+        let r = select! {
+            c = self.stdout.read_u8(), if !self.eof[0] => (c, 0),
+            c = self.stderr.read_u8(), if !self.eof[1] => (c, 1),
+        };
+        match r {
+            (Ok(c), p) => Ok((c, p)),
+            (Err(e), from) => {
+                self.eof[from] = true;
+                if self.eof[0] && self.eof[1] {
+                    Err(e)
+                } else {
+                    Ok((0x0a, from))
+                }
+            }
+        }
+    }
 }

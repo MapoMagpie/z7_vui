@@ -1,95 +1,104 @@
 use boxed_macro::Boxed;
 
-const PASSWORD_LINE: usize = 4;
-
 pub struct Document {
-    // inner: Rope,
     lbs: Lines,
 }
 
 impl Document {
     pub fn new() -> Self {
-        Self {
-            // inner: Rope::from_str(title),
-            lbs: Lines::new(),
-        }
+        Self { lbs: Lines::new() }
     }
 
     pub fn input(&mut self, input: &str) {
+        // info!("document accpet input:\t{}", input);
         self.lbs.input(input);
     }
 
     pub fn output(&self) -> Vec<String> {
-        self.lbs.lines()
+        let mut lines = self.lbs.lines();
+        lines.dedup();
+        lines
     }
 
-    pub fn clear(&mut self) {
-        self.lbs = Lines::new();
+    pub fn layout_list(&mut self) {
+        self.lbs = Lines::new_list();
+    }
+
+    pub fn layout_extract(&mut self) {
+        self.lbs = Lines::new_extract();
     }
 }
 
-struct Lines {
+pub struct Lines {
     inner: Vec<Box<dyn LineBuilder>>,
 }
 
+pub const PASSWORD_LINE: usize = 6;
 impl Lines {
-    fn new() -> Self {
-        Self {
-            // inner: vec![FileSizeLB::boxed(), FilenameLB::boxed()],
-            inner: vec![],
-        }
+    pub fn new() -> Self {
+        Self { inner: vec![] }
     }
+    fn new_list() -> Self {
+        let inner = vec![
+            TitleLB::boxed(),
+            EmptyLB::boxed(),
+            CaptureLB::new_boxed("Listing archive:"), // file name
+            CaptureLB::new_boxed("file,"),            // file size
+            EmptyLB::boxed(),
+            PasswordLB::boxed(),
+            EmptyLB::boxed(),
+            PropertyLB::boxed(),
+            EmptyLB::boxed(),
+            CaptureLB::new_boxed("Date"),
+            CaptureLB::new_boxed("-----"),
+            FileListLB::boxed(),
+            CaptureLB::new_boxed("-----"),
+            ErrorLB::boxed(),
+        ];
+        Self { inner }
+    }
+
+    fn new_extract() -> Self {
+        let inner = vec![
+            TitleLB::boxed(),
+            EmptyLB::boxed(),
+            CaptureLB::new_boxed("Extracting archive:"), // file name
+            CaptureLB::new_boxed("file,"),               // file size
+            EmptyLB::boxed(),
+            PasswordLB::boxed(),
+            EmptyLB::boxed(),
+            PropertyLB::boxed(),
+            EmptyLB::boxed(),
+            CaptureLB::new_boxed("Everything"), // file name
+            ErrorLB::boxed(),
+        ];
+        Self { inner }
+    }
+
     fn input(&mut self, input: &str) {
-        let mut line = CommonLB::boxed();
-        line.input(input);
-        self.inner.push(line);
-        // self.inner.iter_mut().for_each(|lb| lb.input(input));
+        for lb in self.inner.iter_mut() {
+            if lb.input(input) {
+                break;
+            }
+        }
     }
 
     fn lines(&self) -> Vec<String> {
-        self.inner.iter().map(|lb| lb.output()).collect()
+        self.inner.iter().flat_map(|lb| lb.output()).collect()
     }
 }
 
-trait LineBuilder {
-    fn input(&mut self, input: &str);
-    fn output(&self) -> String;
+trait LineBuilder: Send + Sync {
+    /// return true if LineBuilder take this input,
+    /// do not pass it to other LineBuilder
+    fn input(&mut self, _: &str) -> bool {
+        false
+    }
+    fn output(&self) -> Vec<String>;
 }
 
 trait BoxedDefault {
     fn boxed() -> Box<dyn LineBuilder>;
-}
-
-#[derive(Default, Boxed)]
-struct FileSizeLB {
-    inner: String,
-}
-
-impl LineBuilder for FileSizeLB {
-    fn input(&mut self, _: &str) {
-        todo!()
-    }
-
-    fn output(&self) -> String {
-        self.inner.clone()
-    }
-}
-
-#[derive(Default, Boxed)]
-struct FilenameLB {
-    inner: String,
-}
-
-impl LineBuilder for FilenameLB {
-    fn input(&mut self, str: &str) {
-        if str.starts_with("Listing archive: ") {
-            self.inner.push_str(str);
-        }
-    }
-
-    fn output(&self) -> String {
-        self.inner.clone()
-    }
 }
 
 #[derive(Boxed)]
@@ -99,7 +108,7 @@ struct TitleLB {
 
 impl Default for TitleLB {
     fn default() -> Self {
-        let title = r#"7Z-VUI, Shortcuts: `cc`: execute extract|add; `Ctrl+c`: Quit this program;"#;
+        let title = r#"7Z-VUI, Shortcuts: `space+c`: execute extract|add; `space+q`: Quit this program; `space+r`: Retry"#;
         Self {
             inner: title.to_string(),
         }
@@ -107,9 +116,8 @@ impl Default for TitleLB {
 }
 
 impl LineBuilder for TitleLB {
-    fn input(&mut self, _: &str) {}
-    fn output(&self) -> String {
-        self.inner.clone()
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
     }
 }
 
@@ -117,23 +125,156 @@ impl LineBuilder for TitleLB {
 struct EmptyLB;
 
 impl LineBuilder for EmptyLB {
-    fn input(&mut self, _: &str) {}
-    fn output(&self) -> String {
-        "".to_string()
+    fn output(&self) -> Vec<String> {
+        vec!["".to_string()]
     }
 }
 
 #[derive(Default, Boxed)]
-struct CommonLB {
+struct ExtractToLB {
     inner: String,
 }
 
-impl LineBuilder for CommonLB {
-    fn input(&mut self, str: &str) {
+impl LineBuilder for ExtractToLB {
+    fn input(&mut self, str: &str) -> bool {
         self.inner.push_str(str);
+        false
     }
 
-    fn output(&self) -> String {
-        self.inner.clone()
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
+    }
+}
+
+#[derive(Default, Boxed)]
+struct PasswordLB {
+    inner: String,
+}
+
+impl LineBuilder for PasswordLB {
+    fn input(&mut self, str: &str) -> bool {
+        if str.starts_with("Enter password") {
+            self.inner = "Enter password: ".to_string();
+            true
+        } else if str.starts_with("Input password: ") {
+            let password = str.trim_start_matches("Input password: ");
+            self.inner = format!("Enter password: {}", password);
+            true
+        } else {
+            false
+        }
+    }
+    fn output(&self) -> Vec<String> {
+        if self.inner.is_empty() {
+            vec![]
+        } else {
+            vec![self.inner.clone()]
+        }
+    }
+}
+
+#[derive(Default, Boxed)]
+struct FileListLB {
+    inner: Vec<String>,
+}
+
+impl LineBuilder for FileListLB {
+    fn input(&mut self, str: &str) -> bool {
+        // work for left 7 years :)
+        if str.starts_with("202") {
+            self.inner.push(str.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn output(&self) -> Vec<String> {
+        self.inner.to_vec()
+    }
+}
+
+#[derive(Default, Boxed)]
+struct PropertyLB {
+    inner: String,
+    done: bool,
+}
+
+impl LineBuilder for PropertyLB {
+    fn input(&mut self, input: &str) -> bool {
+        if self.done {
+            false
+        } else if input.starts_with("Type = ") {
+            self.inner.push_str(input);
+            true
+        } else if input.starts_with("Method = ") {
+            self.inner.push('\t');
+            self.inner.push_str(input);
+            self.done = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
+    }
+}
+
+struct CaptureLB {
+    inner: String,
+    done: bool,
+    expression: String,
+}
+
+impl CaptureLB {
+    fn new(expression: &str) -> Self {
+        Self {
+            inner: String::new(),
+            done: false,
+            expression: expression.to_string(),
+        }
+    }
+    fn new_boxed(expression: &str) -> Box<dyn LineBuilder> {
+        Box::new(Self::new(expression))
+    }
+}
+
+impl LineBuilder for CaptureLB {
+    fn input(&mut self, input: &str) -> bool {
+        if self.done {
+            false
+        } else if input.contains(&self.expression) {
+            self.inner.push_str(input);
+            self.done = true;
+            true
+        } else {
+            false
+        }
+    }
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
+    }
+}
+
+#[derive(Default, Boxed)]
+struct ErrorLB {
+    inner: Vec<String>,
+    capture: bool,
+}
+
+impl LineBuilder for ErrorLB {
+    fn input(&mut self, input: &str) -> bool {
+        if input.starts_with("ERROR") || input.starts_with("Errors") {
+            self.capture = true;
+        }
+        if self.capture {
+            self.inner.push(input.to_string());
+        }
+        false
+    }
+    fn output(&self) -> Vec<String> {
+        self.inner.to_vec()
     }
 }

@@ -12,7 +12,10 @@ use nvim_rs::{compat::tokio::Compat, create::tokio::new_path, Handler, Neovim, V
 use parity_tokio_ipc::Connection;
 use tokio::{io::WriteHalf, process::Command, sync::mpsc, time::sleep, try_join};
 
-use crate::z7::{Operation, Pushment};
+use crate::{
+    output_format::PASSWORD_LINE,
+    z7::{Operation, Pushment},
+};
 
 // const OUTPUT_FILE: &str = "handler_drop.txt";
 const NVIMPATH: &str = "nvim";
@@ -84,7 +87,7 @@ impl Handler for NeovimHandler {
     // type Writer = Compat<WriteHalf<Connection>>;
     type Writer = Compat<WriteHalf<Connection>>;
 
-    async fn handle_notify(&self, name: String, args: Vec<Value>, _nvim: Neovim<Self::Writer>) {
+    async fn handle_notify(&self, name: String, args: Vec<Value>, nvim: Neovim<Self::Writer>) {
         match name.as_str() {
             "nvim_buf_lines_event" => {
                 let notify = Notify::from(args);
@@ -92,14 +95,28 @@ impl Handler for NeovimHandler {
             }
             "nvim_insert_leave_event" => {
                 info!("handle_notify: name: {}, args: {:?}", name, args);
-                let _ = self
-                    .oper_sender
-                    .try_send(Operation::Password("test".to_string()));
+                // find password from buf line, then send password to 7z
+                let buf = nvim.get_current_buf().await.expect("get current buf error");
+                let pwd_line = PASSWORD_LINE as i64;
+                let lines = buf
+                    .get_lines(pwd_line - 1, pwd_line + 1, false)
+                    .await
+                    .expect("get lines error");
+                let pwd = lines.iter().find(|l| l.starts_with("Enter password: "));
+                if let Some(pwd) = pwd {
+                    let pwd = pwd.trim_start_matches("Enter password: ").to_string();
+                    let _ = self.oper_sender.try_send(Operation::Password(pwd));
+                }
             }
             "nvim_execute_event" => {
                 info!("handle_notify: name: {}, args: {:?}", name, args);
                 // nvim.quit_no_save().await.expect("quit nvim error");
                 let _ = self.oper_sender.send(Operation::Execute).await;
+            }
+            "nvim_retry_event" => {
+                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // nvim.quit_no_save().await.expect("quit nvim error");
+                let _ = self.oper_sender.send(Operation::Retry).await;
             }
             "nvim_vim_leave_event" => {
                 // let _ = self.oper_sender.send(Operation::Execute).await;
@@ -178,10 +195,10 @@ impl Nvim {
             .await
             .expect("attach current buf error");
 
-        // register keymap "cc" to nvim, then nvim will notify "nvim_execute_event" to handler
+        // register keymap "<space>c" to nvim, then nvim will notify "nvim_execute_event" to handler
         nvim.set_keymap(
             "n",
-            "cc",
+            "<space>c",
             r#":call rpcnotify(0, "nvim_execute_event")<CR>"#,
             vec![("silent".into(), true.into())],
         )
@@ -191,14 +208,47 @@ impl Nvim {
             .await
             .expect("subscribe execute event failed");
 
+        // register keymap "<space>c" to nvim, then nvim will notify "nvim_retry_event" to handler
+        nvim.set_keymap(
+            "n",
+            "<space>r",
+            r#":call rpcnotify(0, "nvim_retry_event")<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await
+        .expect("set keymap error");
+        nvim.subscribe("nvim_retry_event")
+            .await
+            .expect("subscribe retry event failed");
+
+        // register keymap "<space>q" to nvim, then nvim will quit
+        nvim.set_keymap(
+            "n",
+            "<space>q",
+            r#":qa!<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await
+        .expect("set keymap error");
+
         // receive pushment from 7z, then push to nvim
         let wait_push = async move {
             while let Some(pushment) = doc_recv.recv().await {
                 match pushment {
-                    Pushment::Full(lines) => {
+                    Pushment::Full(lines, cursor) => {
                         info!("recv pushment: {:?}", lines);
                         let line_count = curbuf.line_count().await.expect("get line count error");
                         let _ = curbuf.set_lines(0, line_count, false, lines).await;
+                        if let Some((col, row)) = cursor {
+                            let win = nvim.get_current_win().await.expect("get current win error");
+                            win.set_cursor((col as i64, row as i64))
+                                .await
+                                .expect("set cursor error");
+                            let _ = nvim
+                                .call("nvim_command", vec!["startinsert!".into()])
+                                .await
+                                .expect("start insert error");
+                        }
                     }
                     Pushment::Line(_line, _content) => {
                         unreachable!()
