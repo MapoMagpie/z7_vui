@@ -40,7 +40,6 @@ pub struct Z7 {
     doc_sender: mpsc::Sender<Pushment>,
     password: Arc<RwLock<Option<String>>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
-    need_password: Arc<RwLock<bool>>,
 }
 
 impl Z7 {
@@ -50,7 +49,6 @@ impl Z7 {
             doc_sender: pusher,
             password: Arc::new(RwLock::new(None)),
             stdin_pipe: Arc::new(RwLock::new(None)),
-            need_password: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -60,13 +58,12 @@ impl Z7 {
 
         let doc = self.document.clone();
         let doc_pusher = self.doc_sender.clone();
-        let need_password = self.need_password.clone();
 
         // begin to execute 'list' command first, then output will push to nvim
         cmd_sender.send(Cmd::List).await.expect("cmd sender error");
         try_join!(
             self.executing(cmd_sender, cmd_recv, opt_sender, oper_recv),
-            read_document(opt_recv, doc_pusher, doc, need_password)
+            read_document(opt_recv, doc_pusher, doc)
         )
         .map(|_| ())
     }
@@ -96,14 +93,6 @@ impl Z7 {
                     }
                 }
                 Operation::Password(pwd) => {
-                    {
-                        let mut password = self.password.write().await;
-                        password.replace(pwd.clone());
-                    }
-                    {
-                        let mut doc = self.document.write().await;
-                        doc.input(format!("Input password: {}", pwd).as_str());
-                    }
                     self.write_password(&pwd).await;
                 }
             }
@@ -136,13 +125,16 @@ impl Z7 {
     /// then child will continue to execute with output
     async fn write_password(&mut self, pwd: &str) {
         {
-            let mut need_password = self.need_password.write().await;
-            if !*need_password {
-                info!("Do not need password");
+            let mut password = self.password.write().await;
+            let new_password = pwd.to_string();
+            if password.is_some() && password.as_ref().unwrap() == &new_password {
                 return;
-            } else {
-                *need_password = false;
             }
+            password.replace(new_password);
+        }
+        {
+            let mut doc = self.document.write().await;
+            doc.input(format!("Input password: {}", pwd).as_str());
         }
         let mut stdin = self.stdin_pipe.write().await;
         // will set stdin to None
@@ -150,7 +142,7 @@ impl Z7 {
             info!("writed password: {}", pwd);
             pipe.write_all(pwd.as_bytes()).await.unwrap();
         } else {
-            error!("7z command stdin pipe is none");
+            info!("7z command stdin pipe is none");
         }
     }
 }
@@ -161,19 +153,16 @@ async fn read_document(
     mut opt_recv: mpsc::Receiver<Option<String>>,
     doc_sender: mpsc::Sender<Pushment>,
     doc: Arc<RwLock<Document>>,
-    need_password: Arc<RwLock<bool>>,
 ) -> tokio::io::Result<()> {
     while let Some(line) = opt_recv.recv().await {
         match line {
             Some(line) => {
-                info!("recv output: {}", line);
+                // info!("recv output: {}", line);
                 {
                     let mut doc = doc.write().await;
                     doc.input(line.as_str());
                 }
                 if line.starts_with("Enter password") {
-                    let mut np = need_password.write().await;
-                    *np = true;
                     let lines = {
                         let doc = doc.read().await;
                         doc.output()

@@ -1,10 +1,4 @@
-use std::{
-    fmt::Debug,
-    io::stdout,
-    path::Path,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fmt::Debug, io::stdout, path::Path, time::Duration};
 
 use async_trait::async_trait;
 use log::{error, info};
@@ -20,14 +14,14 @@ use crate::{
 // const OUTPUT_FILE: &str = "handler_drop.txt";
 const NVIMPATH: &str = "nvim";
 
-pub struct Notify {
+pub struct BufLineChanges {
     line_start: u64,
     line_end: u64,
     buf_id: i64,
     content: Vec<String>,
 }
 
-impl From<Vec<Value>> for Notify {
+impl From<Vec<Value>> for BufLineChanges {
     fn from(args: Vec<Value>) -> Self {
         let line_start = args[2].as_u64().unwrap();
         let line_end = args[3].as_u64().unwrap();
@@ -46,7 +40,7 @@ impl From<Vec<Value>> for Notify {
     }
 }
 
-impl Debug for Notify {
+impl Debug for BufLineChanges {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -56,29 +50,14 @@ impl Debug for Notify {
     }
 }
 
-pub struct BehaviorAnalyzer;
-
-impl BehaviorAnalyzer {
-    fn analyze(&self, _input: Notify) {
-        // info!("analyze: {:?}", input);
-    }
-}
-
 #[derive(Clone)]
 struct NeovimHandler {
-    analyzer: Arc<Mutex<BehaviorAnalyzer>>,
     oper_sender: mpsc::Sender<Operation>,
 }
 
 impl NeovimHandler {
-    pub fn new(
-        analyzer: Arc<Mutex<BehaviorAnalyzer>>,
-        oper_sender: mpsc::Sender<Operation>,
-    ) -> Self {
-        Self {
-            analyzer,
-            oper_sender,
-        }
+    pub fn new(oper_sender: mpsc::Sender<Operation>) -> Self {
+        Self { oper_sender }
     }
 }
 
@@ -90,8 +69,11 @@ impl Handler for NeovimHandler {
     async fn handle_notify(&self, name: String, args: Vec<Value>, nvim: Neovim<Self::Writer>) {
         match name.as_str() {
             "nvim_buf_lines_event" => {
-                let notify = Notify::from(args);
-                self.analyzer.lock().unwrap().analyze(notify);
+                info!("handle_notify: name: {}, args: {:?}", name, args);
+                let buf_line = BufLineChanges::from(args);
+                if buf_line.content.len() == 1 && buf_line.content[0] == "Enter password: " {
+                    let _ = self.oper_sender.send(Operation::Retry).await;
+                }
             }
             "nvim_insert_leave_event" => {
                 info!("handle_notify: name: {}, args: {:?}", name, args);
@@ -104,8 +86,11 @@ impl Handler for NeovimHandler {
                     .expect("get lines error");
                 let pwd = lines.iter().find(|l| l.starts_with("Enter password: "));
                 if let Some(pwd) = pwd {
-                    let pwd = pwd.trim_start_matches("Enter password: ").to_string();
-                    let _ = self.oper_sender.try_send(Operation::Password(pwd));
+                    let pwd = pwd.trim_start_matches("Enter password:").to_string();
+                    let pwd = pwd.trim().to_string();
+                    if !pwd.is_empty() {
+                        let _ = self.oper_sender.try_send(Operation::Password(pwd));
+                    }
                 }
             }
             "nvim_execute_event" => {
@@ -152,7 +137,7 @@ impl Nvim {
 
         // clone oper_sender to NeovimHandler, it will drop when nvim quit, i want keep it alive;
         let oper_sender_ = oper_sender.clone();
-        let handler = NeovimHandler::new(Arc::new(Mutex::new(BehaviorAnalyzer)), oper_sender_);
+        let handler = NeovimHandler::new(oper_sender_);
         let (nvim, io_handle) = new_path(path, handler)
             .await
             .expect("connect to nvim failed");
@@ -170,6 +155,18 @@ impl Nvim {
         )
         .await
         .expect("create autocmd error");
+        // register keymap "<CR>" at insert mode, if the line start with "Enter password: ",
+        // nvim.set_keymap(
+        //     "i",
+        //     "<CR>",
+        //     r###"call vim.api.nvim_exec_lua(if string.find(vim.api.nvim_get_current_line(), "^Enter password") then return "asdasdads" end return "<cr>" end)"###,
+        //     vec![
+        //         ("silent".into(), true.into()),
+        //     ],
+        // )
+        // .await
+        // .expect("set keymap error");
+        // then notify "nvim_insert_leave_event" to handler
         nvim.subscribe("nvim_insert_leave_event")
             .await
             .expect("subscribe insert leave event failed");
@@ -208,7 +205,7 @@ impl Nvim {
             .await
             .expect("subscribe execute event failed");
 
-        // register keymap "<space>c" to nvim, then nvim will notify "nvim_retry_event" to handler
+        // register keymap "<space>r" to nvim, then nvim will notify "nvim_retry_event" to handler
         nvim.set_keymap(
             "n",
             "<space>r",

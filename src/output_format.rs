@@ -10,7 +10,6 @@ impl Document {
     }
 
     pub fn input(&mut self, input: &str) {
-        // info!("document accpet input:\t{}", input);
         self.lbs.input(input);
     }
 
@@ -52,7 +51,6 @@ impl Lines {
             CaptureLB::new_boxed("Date"),
             CaptureLB::new_boxed("-----"),
             FileListLB::boxed(),
-            CaptureLB::new_boxed("-----"),
             ErrorLB::boxed(),
         ];
         Self { inner }
@@ -181,7 +179,7 @@ struct FileListLB {
 impl LineBuilder for FileListLB {
     fn input(&mut self, str: &str) -> bool {
         // work for left 7 years :)
-        if str.starts_with("202") {
+        if str.starts_with("202") || (!self.inner.is_empty() && str.starts_with("-----")) {
             self.inner.push(str.to_string());
             true
         } else {
@@ -260,21 +258,19 @@ impl LineBuilder for CaptureLB {
 
 #[derive(Default, Boxed)]
 struct ErrorLB {
-    inner: Vec<String>,
-    capture: bool,
+    inner: String,
 }
 
 impl LineBuilder for ErrorLB {
     fn input(&mut self, input: &str) -> bool {
-        if input.starts_with("ERROR") || input.starts_with("Errors") {
-            self.capture = true;
+        if input.starts_with("ERROR:") {
+            self.inner.push_str(input);
+            true
+        } else {
+            false
         }
-        if self.capture {
-            self.inner.push(input.to_string());
-        }
-        false
     }
     fn output(&self) -> Vec<String> {
-        self.inner.to_vec()
+        vec![self.inner.clone()]
     }
 }
