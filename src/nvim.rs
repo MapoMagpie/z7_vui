@@ -114,6 +114,8 @@ impl Handler for NeovimHandler {
     }
 }
 
+const HIGHLIGHT_ERROR_GROUP: &str = "DiagnosticError";
+
 pub struct Nvim;
 
 impl Nvim {
@@ -233,9 +235,20 @@ impl Nvim {
             while let Some(pushment) = doc_recv.recv().await {
                 match pushment {
                     Pushment::Full(lines, cursor) => {
-                        info!("recv pushment: {:?}", lines);
+                        // info!("recv pushment: {:?}", lines);
+                        let err_line = lines
+                            .iter()
+                            .enumerate()
+                            .find(|l| l.1.starts_with("ERROR:"))
+                            .map(|(col, _)| col);
                         let line_count = curbuf.line_count().await.expect("get line count error");
                         let _ = curbuf.set_lines(0, line_count, false, lines).await;
+                        if let Some(err_col) = err_line {
+                            curbuf
+                                .add_highlight(-1, HIGHLIGHT_ERROR_GROUP, err_col as i64, 0, -1)
+                                .await
+                                .expect("add highlight error");
+                        }
                         if let Some((col, row)) = cursor {
                             let win = nvim.get_current_win().await.expect("get current win error");
                             win.set_cursor((col as i64, row as i64))
