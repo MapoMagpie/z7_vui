@@ -14,5 +14,8 @@ async fn main() {
     let (oper_sender, oper_recv) = mpsc::channel::<Operation>(1);
 
     let mut z7 = Z7::new(doc_sender);
-    let _ = try_join!(z7.start(oper_recv), Nvim::start(doc_recv, oper_sender));
+    let _ = try_join!(
+        z7.start(oper_recv, oper_sender.clone()),
+        Nvim::start(doc_recv, oper_sender)
+    );
 }

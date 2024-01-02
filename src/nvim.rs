@@ -1,8 +1,15 @@
-use std::{fmt::Debug, io::stdout, path::Path, time::Duration};
+use std::{
+    fmt::Debug,
+    io::{stdout, ErrorKind},
+    path::Path,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use log::{error, info};
-use nvim_rs::{compat::tokio::Compat, create::tokio::new_path, Handler, Neovim, Value};
+use nvim_rs::{
+    compat::tokio::Compat, create::tokio::new_path, error::CallError, Handler, Neovim, Value,
+};
 use parity_tokio_ipc::Connection;
 use tokio::{io::WriteHalf, process::Command, sync::mpsc, time::sleep, try_join};
 
@@ -69,14 +76,14 @@ impl Handler for NeovimHandler {
     async fn handle_notify(&self, name: String, args: Vec<Value>, nvim: Neovim<Self::Writer>) {
         match name.as_str() {
             "nvim_buf_lines_event" => {
-                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // info!("handle_notify: name: {}, args: {:?}", name, args);
                 let buf_line = BufLineChanges::from(args);
                 if buf_line.content.len() == 1 && buf_line.content[0] == "Enter password: " {
-                    let _ = self.oper_sender.send(Operation::Retry).await;
+                    let _ = self.oper_sender.try_send(Operation::Retry);
                 }
             }
             "nvim_insert_leave_event" => {
-                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // info!("handle_notify: name: {}, args: {:?}", name, args);
                 // find password from buf line, then send password to 7z
                 let buf = nvim.get_current_buf().await.expect("get current buf error");
                 let pwd_line = PASSWORD_LINE as i64;
@@ -94,17 +101,27 @@ impl Handler for NeovimHandler {
                 }
             }
             "nvim_execute_event" => {
-                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // info!("handle_notify: name: {}, args: {:?}", name, args);
                 // nvim.quit_no_save().await.expect("quit nvim error");
-                let _ = self.oper_sender.send(Operation::Execute).await;
+                let _ = self.oper_sender.try_send(Operation::Execute);
+            }
+            "nvim_select_password_event" => {
+                info!("handle_notify: name: {}, args: {:?}", name, args);
+                let pwd = args[0].as_str();
+                if let Some(pwd) = pwd {
+                    let _ = self
+                        .oper_sender
+                        .try_send(Operation::SelectPassword(pwd.to_string()));
+                }
             }
             "nvim_retry_event" => {
-                info!("handle_notify: name: {}, args: {:?}", name, args);
+                // info!("handle_notify: name: {}, args: {:?}", name, args);
                 // nvim.quit_no_save().await.expect("quit nvim error");
-                let _ = self.oper_sender.send(Operation::Retry).await;
+                let _ = self.oper_sender.try_send(Operation::Retry);
             }
             "nvim_vim_leave_event" => {
                 // let _ = self.oper_sender.send(Operation::Execute).await;
+                self.oper_sender.closed().await;
                 info!("handle_notify: name: {}, args: {:?}", name, args);
             }
             _ => {
@@ -144,91 +161,16 @@ impl Nvim {
             .await
             .expect("connect to nvim failed");
 
-        // register "nvim_insert_leave_event", then subscribe it
-        // nvim_insert_leave_event has been triggered, then check password from buf line, then send password to 7z
-        nvim.create_autocmd(
-            Value::Array(vec!["InsertLeave".into()]),
-            vec![(
-                "command".into(),
-                Value::String(
-                    r#"call rpcnotify(0, "nvim_insert_leave_event", [mode(), nvim_win_get_cursor(0)])"#.into(),
-                ),
-            )],
-        )
-        .await
-        .expect("create autocmd error");
-        // register keymap "<CR>" at insert mode, if the line start with "Enter password: ",
-        // nvim.set_keymap(
-        //     "i",
-        //     "<CR>",
-        //     r###"call vim.api.nvim_exec_lua(if string.find(vim.api.nvim_get_current_line(), "^Enter password") then return "asdasdads" end return "<cr>" end)"###,
-        //     vec![
-        //         ("silent".into(), true.into()),
-        //     ],
-        // )
-        // .await
-        // .expect("set keymap error");
-        // then notify "nvim_insert_leave_event" to handler
-        nvim.subscribe("nvim_insert_leave_event")
+        Self::initialize_nvim(&nvim)
             .await
-            .expect("subscribe insert leave event failed");
-
-        // register "nvim_vim_leave_event", then subscribe it
-        nvim.create_autocmd(
-            Value::Array(vec!["VimLeave".into()]),
-            vec![(
-                "command".into(),
-                Value::String(r#"call rpcnotify(0, "nvim_vim_leave_event")"#.into()),
-            )],
-        )
-        .await
-        .expect("create autocmd error");
-        nvim.subscribe("nvim_vim_leave_event")
-            .await
-            .expect("subscribe vim leave event failed");
+            .expect("initialize nvim error");
 
         // attach buf to subscribe "nvim_buf_lines_event"
         let curbuf = nvim.get_current_buf().await.expect("get current buf error");
         curbuf
             .attach(false, vec![])
             .await
-            .expect("attach current buf error");
-
-        // register keymap "<space>c" to nvim, then nvim will notify "nvim_execute_event" to handler
-        nvim.set_keymap(
-            "n",
-            "<space>c",
-            r#":call rpcnotify(0, "nvim_execute_event")<CR>"#,
-            vec![("silent".into(), true.into())],
-        )
-        .await
-        .expect("set keymap error");
-        nvim.subscribe("nvim_execute_event")
-            .await
-            .expect("subscribe execute event failed");
-
-        // register keymap "<space>r" to nvim, then nvim will notify "nvim_retry_event" to handler
-        nvim.set_keymap(
-            "n",
-            "<space>r",
-            r#":call rpcnotify(0, "nvim_retry_event")<CR>"#,
-            vec![("silent".into(), true.into())],
-        )
-        .await
-        .expect("set keymap error");
-        nvim.subscribe("nvim_retry_event")
-            .await
-            .expect("subscribe retry event failed");
-
-        // register keymap "<space>q" to nvim, then nvim will quit
-        nvim.set_keymap(
-            "n",
-            "<space>q",
-            r#":qa!<CR>"#,
-            vec![("silent".into(), true.into())],
-        )
-        .await
-        .expect("set keymap error");
+            .expect("attach buf error");
 
         // receive pushment from 7z, then push to nvim
         let wait_push = async move {
@@ -269,7 +211,7 @@ impl Nvim {
                 }
             }
             info!("pushment recv closed");
-            Result::<(), ()>::Ok(())
+            tokio::io::Result::<()>::Err(ErrorKind::Other.into())
         };
 
         let wait_io = async move {
@@ -285,10 +227,80 @@ impl Nvim {
                 }
             }
             // return error, then other task will be canceled
-            Result::<(), ()>::Err(())
+            tokio::io::Result::<()>::Err(ErrorKind::Other.into())
         };
 
         let _ = try_join!(wait_push, wait_io);
+        info!("nvim quit");
+        Ok(())
+    }
+
+    async fn initialize_nvim(
+        nvim: &Neovim<Compat<WriteHalf<Connection>>>,
+    ) -> Result<(), Box<CallError>> {
+        // register "nvim_insert_leave_event", then subscribe it
+        // nvim_insert_leave_event has been triggered, then check password from buf line, then send password to 7z
+        nvim.create_autocmd(
+            Value::Array(vec!["InsertLeave".into()]),
+            vec![(
+                "command".into(),
+                Value::String(
+                    r#"call rpcnotify(0, "nvim_insert_leave_event", [mode(), nvim_win_get_cursor(0)])"#.into(),
+                ),
+            )],
+        )
+        .await?;
+        nvim.subscribe("nvim_insert_leave_event").await?;
+
+        // register "nvim_vim_leave_event", then subscribe it
+        nvim.create_autocmd(
+            Value::Array(vec!["VimLeave".into()]),
+            vec![(
+                "command".into(),
+                Value::String(r#"call rpcnotify(0, "nvim_vim_leave_event")"#.into()),
+            )],
+        )
+        .await?;
+        nvim.subscribe("nvim_vim_leave_event").await?;
+
+        // register keymap "<space>c" to nvim, then nvim will notify "nvim_execute_event" to handler
+        nvim.set_keymap(
+            "n",
+            "<space>c",
+            r#":call rpcnotify(0, "nvim_execute_event")<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await?;
+        nvim.subscribe("nvim_execute_event").await?;
+
+        // register keymap "<space>r" to nvim, then nvim will notify "nvim_retry_event" to handler
+        nvim.set_keymap(
+            "n",
+            "<space>r",
+            r#":call rpcnotify(0, "nvim_retry_event")<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await?;
+        nvim.subscribe("nvim_retry_event").await?;
+
+        // register keymap "<space>q" to nvim, then nvim will quit
+        nvim.set_keymap(
+            "n",
+            "<space>q",
+            r#":qa!<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await?;
+
+        // register keymap "<space>x" to nvim
+        nvim.set_keymap(
+            "n",
+            "<space>x",
+            r#"yiw:call rpcnotify(0, "nvim_select_password_event", getreg(0))<CR>"#,
+            vec![("silent".into(), true.into())],
+        )
+        .await?;
+        nvim.subscribe("nvim_select_password_event").await?;
         Ok(())
     }
 }

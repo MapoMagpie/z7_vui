@@ -1,3 +1,5 @@
+use std::fs;
+
 use boxed_macro::Boxed;
 
 pub struct Document {
@@ -146,28 +148,53 @@ impl LineBuilder for ExtractToLB {
 
 #[derive(Default, Boxed)]
 struct PasswordLB {
-    inner: String,
+    inner: Vec<String>,
+    password_history: Vec<String>,
 }
 
 impl LineBuilder for PasswordLB {
     fn input(&mut self, str: &str) -> bool {
+        // init password history
+        if (str.starts_with("Enter password") || str.starts_with("Input password: "))
+            && self.inner.is_empty()
+        {
+            self.inner.push(String::new());
+            // read password history from file config/password_history.txt
+            if let Ok(password_history) = fs::read_to_string("config/password_history.txt") {
+                self.password_history = password_history
+                    .lines()
+                    .map(|line| line.trim().to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<String>>();
+                self.inner.push(format!(
+                    "select password use [x]: {}",
+                    self.password_history.join(" | ")
+                ));
+            }
+        }
         if str.starts_with("Enter password") {
-            self.inner = "Enter password: ".to_string();
+            self.inner[0] = "Enter password: ".to_string();
             true
         } else if str.starts_with("Input password: ") {
             let password = str.trim_start_matches("Input password: ");
-            self.inner = format!("Enter password: {}", password);
+            self.inner[0] = format!("Enter password: {}", password);
+            self.password_history.push(password.to_string());
+            true
+        } else if str.starts_with("Save password") && self.inner.len() >= 2 {
+            self.password_history.sort();
+            self.password_history.dedup();
+            fs::write(
+                "config/password_history.txt",
+                self.password_history.join("\n"),
+            )
+            .expect("write password history failed");
             true
         } else {
             false
         }
     }
     fn output(&self) -> Vec<String> {
-        if self.inner.is_empty() {
-            vec![]
-        } else {
-            vec![self.inner.clone()]
-        }
+        self.inner.to_vec()
     }
 }
 
