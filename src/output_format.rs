@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, ops::Range};
 
 use boxed_macro::Boxed;
 
@@ -21,23 +21,35 @@ impl Document {
         lines
     }
 
+    pub fn files(&self) -> Vec<String> {
+        self.lbs.file_list_lb.files()
+    }
+
     pub fn layout_list(&mut self) {
-        self.lbs = Lines::new_list();
+        let mut lbs = Lines::new_list();
+        std::mem::swap(&mut self.lbs, &mut lbs);
+        self.lbs.file_list_lb = lbs.file_list_lb;
     }
 
     pub fn layout_extract(&mut self) {
-        self.lbs = Lines::new_extract();
+        let mut lbs = Lines::new_extract();
+        std::mem::swap(&mut self.lbs, &mut lbs);
+        self.lbs.file_list_lb = lbs.file_list_lb;
     }
 }
 
 pub struct Lines {
     inner: Vec<Box<dyn LineBuilder>>,
+    file_list_lb: FileListLB,
 }
 
 pub const PASSWORD_LINE: usize = 6;
 impl Lines {
-    pub fn new() -> Self {
-        Self { inner: vec![] }
+    fn new() -> Self {
+        Self {
+            inner: vec![],
+            file_list_lb: FileListLB::default(),
+        }
     }
     fn new_list() -> Self {
         let inner = vec![
@@ -50,12 +62,13 @@ impl Lines {
             EmptyLB::boxed(),
             PropertyLB::boxed(),
             EmptyLB::boxed(),
-            CaptureLB::new_boxed("Date"),
-            CaptureLB::new_boxed("-----"),
-            FileListLB::boxed(),
             ErrorLB::boxed(),
+            EmptyLB::boxed(),
         ];
-        Self { inner }
+        Self {
+            inner,
+            file_list_lb: FileListLB::default(),
+        }
     }
 
     fn new_extract() -> Self {
@@ -71,11 +84,18 @@ impl Lines {
             EmptyLB::boxed(),
             CaptureLB::new_boxed("Everything"), // file name
             ErrorLB::boxed(),
+            EmptyLB::boxed(),
         ];
-        Self { inner }
+        Self {
+            inner,
+            file_list_lb: FileListLB::default(),
+        }
     }
 
     fn input(&mut self, input: &str) {
+        if self.file_list_lb.input(input) {
+            return;
+        }
         for lb in self.inner.iter_mut() {
             if lb.input(input) {
                 break;
@@ -84,11 +104,13 @@ impl Lines {
     }
 
     fn lines(&self) -> Vec<String> {
-        self.inner.iter().flat_map(|lb| lb.output()).collect()
+        let mut lines: Vec<String> = self.inner.iter().flat_map(|lb| lb.output()).collect();
+        lines.append(&mut self.file_list_lb.output());
+        lines
     }
 }
 
-trait LineBuilder: Send + Sync {
+trait LineBuilder: Send + Sync + 'static {
     /// return true if LineBuilder take this input,
     /// do not pass it to other LineBuilder
     fn input(&mut self, _: &str) -> bool {
@@ -127,22 +149,6 @@ struct EmptyLB;
 impl LineBuilder for EmptyLB {
     fn output(&self) -> Vec<String> {
         vec!["".to_string()]
-    }
-}
-
-#[derive(Default, Boxed)]
-struct ExtractToLB {
-    inner: String,
-}
-
-impl LineBuilder for ExtractToLB {
-    fn input(&mut self, str: &str) -> bool {
-        self.inner.push_str(str);
-        false
-    }
-
-    fn output(&self) -> Vec<String> {
-        vec![self.inner.clone()]
     }
 }
 
@@ -198,16 +204,66 @@ impl LineBuilder for PasswordLB {
     }
 }
 
+struct FileLB {
+    filename: String,
+    prefix: String,
+}
+
+impl From<&FileLB> for String {
+    fn from(val: &FileLB) -> Self {
+        [val.prefix.clone(), val.filename.clone()].concat()
+    }
+}
+
+impl From<(&str, &[Range<usize>; 5])> for FileLB {
+    fn from((str, tem): (&str, &[Range<usize>; 5])) -> Self {
+        let chars = str.chars().collect::<Vec<char>>();
+        let prefix = String::from_iter(&chars[tem[0].start..tem[4].start]);
+        let filename = String::from_iter(&chars[tem[4].start..]);
+        Self { filename, prefix }
+    }
+}
+
 #[derive(Default, Boxed)]
 struct FileListLB {
-    inner: Vec<String>,
+    inner: Vec<FileLB>,
+    header_line: Option<String>,
+    begin_line: Option<String>,
+    end_line: Option<String>,
+    template: Option<[Range<usize>; 5]>,
+    summary_line: String,
+    capture: bool,
+}
+
+impl FileListLB {
+    fn files(&self) -> Vec<String> {
+        self.inner.iter().map(|f| f.filename.clone()).collect()
+    }
 }
 
 impl LineBuilder for FileListLB {
     fn input(&mut self, str: &str) -> bool {
-        // work for left 7 years :)
-        if str.starts_with("202") || (!self.inner.is_empty() && str.starts_with("-----")) {
-            self.inner.push(str.to_string());
+        if str.starts_with("-----") {
+            if self.begin_line.is_none() {
+                self.template = Some(parse_dash_line_to_range(str));
+                self.begin_line = Some(str.to_string());
+                self.capture = true;
+            } else {
+                self.end_line = Some(str.to_string());
+            }
+            true
+        } else if self.capture {
+            // capture the summary line
+            if self.end_line.is_some() {
+                self.capture = false;
+                self.summary_line = str.to_string();
+            } else {
+                self.inner
+                    .push(FileLB::from((str, self.template.as_ref().unwrap())));
+            }
+            true
+        } else if str.contains("Attr") {
+            self.header_line = Some(str.to_string());
             true
         } else {
             false
@@ -215,8 +271,42 @@ impl LineBuilder for FileListLB {
     }
 
     fn output(&self) -> Vec<String> {
-        self.inner.to_vec()
+        let files = self.inner.iter().map(String::from).collect();
+        [
+            self.header_line.clone().map_or(vec![], |l| vec![l]),
+            self.begin_line.clone().map_or(vec![], |l| vec![l]),
+            files,
+            self.end_line
+                .clone()
+                .map_or(vec![], |l| vec![l, self.summary_line.clone()]),
+        ]
+        .concat()
     }
+}
+
+fn parse_dash_line_to_range(line: &str) -> [Range<usize>; 5] {
+    let mut ra: [Range<usize>; 5] = Default::default();
+    let mut cur_i = 0;
+    let mut start = 0;
+    let mut len = 0;
+    let mut last_c = ' ';
+    for (i, c) in line.char_indices() {
+        len += 1;
+        if c == ' ' {
+            if last_c == ' ' {
+                start = i + 1;
+                continue;
+            }
+            ra[cur_i].start = start;
+            ra[cur_i].end = i;
+            cur_i += 1;
+            start = i + 1;
+        }
+        last_c = c;
+    }
+    ra[cur_i].start = start;
+    ra[cur_i].end = len;
+    ra
 }
 
 #[derive(Default, Boxed)]
@@ -299,5 +389,64 @@ impl LineBuilder for ErrorLB {
     }
     fn output(&self) -> Vec<String> {
         vec![self.inner.clone()]
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::{parse_dash_line_to_range, FileListLB, LineBuilder};
+    #[test]
+    fn test_parse_dash_line_to_range() {
+        let ra = parse_dash_line_to_range("--- --- ---- ---- -----");
+        assert_eq!(ra, [0..3, 4..7, 8..12, 13..17, 18..23]);
+        let ra = parse_dash_line_to_range("--- --- ---- ----  -----");
+        assert_eq!(ra, [0..3, 4..7, 8..12, 13..17, 19..24]);
+    }
+
+    #[test]
+    fn test_file_list_lb() {
+        let mut flb = FileListLB::default();
+        let raw = r##"
+------------------- ----- ------------ ------------  ------------------------
+2023-12-22 16:17:58 D....            0            0  test
+2023-12-12 09:18:24 ....A       344963     13216256  test/01-e_01.png
+2023-12-12 09:18:28 ....A       821434               test/02-e_02.png
+2023-12-12 09:18:26 ....A       608418               test/03-e_03.png
+2023-12-12 09:18:28 ....A       757826               test/04-e_04.png
+2023-12-12 09:18:28 ....A       790792               test/05-e_05.png
+2023-12-12 09:18:30 ....A       712878               test/06-e_06.png
+2023-12-12 09:18:30 ....A       740854               test/07-e_07.png
+2023-12-12 09:18:30 ....A       711147               test/08-e_08.png
+2023-12-12 09:18:32 ....A       724006               test/09-e_09.png
+2023-12-12 09:18:32 ....A       637246               test/10-e_10.png
+2023-12-12 09:18:32 ....A       739784               test/11-e_11.png
+2023-12-12 09:18:34 ....A       733386               test/12-e_12.png
+2023-12-12 09:18:34 ....A       683368               test/13-e_13.png
+2023-12-12 09:18:34 ....A       740540               test/14-e_14.png
+2023-12-12 09:18:38 ....A       781016               test/15-e_15.png
+2023-12-12 09:18:38 ....A       681962               test/16-e_16.png
+2023-12-12 09:18:38 ....A       830510               test/17-e_17.png
+2023-12-12 09:18:40 ....A       220106               test/18-e_18.png
+2023-12-12 09:18:40 ....A       436832               test/19-e_19.png
+2023-12-12 09:18:40 ....A       311853               test/20-e_20.png
+2023-12-12 09:18:42 ....A       328685               test/21-MT43.jpg
+2023-12-12 09:18:42 ....A          473               test/meta.json
+------------------- ----- ------------ ------------  ------------------------
+2023-12-22 16:17:58           13338079     13216256  22 files, 1 folders
+"##;
+        raw.lines().for_each(|l| {
+            let _ = flb.input(l);
+        });
+        let lb: Box<dyn LineBuilder> = Box::new(flb);
+        lb.output().iter().for_each(|l| {
+            println!("{}", l);
+        });
+
+        let a = lb.as_ref() as *const dyn LineBuilder as *const FileListLB;
+        let a = unsafe { &*a };
+        a.files().iter().for_each(|f| {
+            println!("{}", f);
+        });
     }
 }

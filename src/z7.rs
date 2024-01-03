@@ -222,6 +222,7 @@ async fn read_document(
                 {
                     let mut doc = doc.write().await;
                     doc.input(line.as_str());
+                    doc.files();
                 }
                 if line.starts_with("Enter password") {
                     let lines = {
