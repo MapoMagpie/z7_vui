@@ -112,9 +112,8 @@ impl Z7 {
         };
         let mut z7_1 = self.clone();
         let mut z7_2 = self.clone();
-
         try_join!(
-            z7_1.executing(cmd_sender, oper_recv),
+            z7_1.operation_make(cmd_sender, oper_recv),
             z7_2.executing_cmd(cmd_recv, opt_sender),
             self.read_document(opt_recv, oper_sender),
             wait_doc_sender_closed
@@ -171,14 +170,6 @@ impl Z7 {
         }
         info!("operation recv closed");
         Ok(())
-    }
-
-    pub async fn executing(
-        &mut self,
-        cmd_sender: mpsc::Sender<Cmd>,
-        oper_recv: mpsc::Receiver<Operation>,
-    ) -> tokio::io::Result<()> {
-        self.operation_make(cmd_sender, oper_recv).await
     }
 
     /// write password to child stdin,
