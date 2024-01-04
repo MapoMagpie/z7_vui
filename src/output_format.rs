@@ -161,30 +161,38 @@ struct PasswordLB {
 impl LineBuilder for PasswordLB {
     fn input(&mut self, str: &str) -> bool {
         // init password history
-        if (str.starts_with("Enter password") || str.starts_with("Input password: "))
+        if (str.starts_with("Enter password") || str.starts_with("Input passsword"))
             && self.inner.is_empty()
         {
             self.inner.push(String::new());
+        }
+        if str.starts_with("Password history file: ") {
             // read password history from file config/password_history.txt
-            if let Ok(password_history) = fs::read_to_string("config/password_history.txt") {
+            if let Ok(password_history) =
+                fs::read_to_string(str.trim_start_matches("Password history file: "))
+            {
                 self.password_history = password_history
                     .lines()
                     .map(|line| line.trim().to_string())
                     .filter(|line| !line.is_empty())
                     .collect::<Vec<String>>();
+                if self.inner.len() > 1 {
+                    self.inner.pop();
+                }
                 self.inner.push(format!(
-                    "select password use [x]: {}",
+                    "select password use [Ctrl+x]: {}",
                     self.password_history.join(" | ")
                 ));
             }
+            return true;
         }
         if str.starts_with("Enter password") {
             self.inner[0] = "Enter password: ".to_string();
             true
-        } else if str.starts_with("Input password: ") {
+        } else if str.starts_with("Input password") {
             let password = str.trim_start_matches("Input password: ");
             self.inner[0] = format!("Enter password: {}", password);
-            self.password_history.push(password.to_string());
+            // self.password_history.push(password.to_string());
             true
         } else if str.starts_with("Save password") && self.inner.len() >= 2 {
             self.password_history.sort();
@@ -204,35 +212,39 @@ impl LineBuilder for PasswordLB {
     }
 }
 
-struct FileLB {
+struct FileLine {
     filename: String,
-    prefix: String,
+    raw: String,
 }
 
-impl From<&FileLB> for String {
-    fn from(val: &FileLB) -> Self {
-        [val.prefix.clone(), val.filename.clone()].concat()
+impl FileLine {
+    fn to_string(&self, extract_path: &str) -> String {
+        format!("{}{}{}", self.raw, extract_path, self.filename)
     }
 }
 
-impl From<(&str, &[Range<usize>; 5])> for FileLB {
+impl From<(&str, &[Range<usize>; 5])> for FileLine {
     fn from((str, tem): (&str, &[Range<usize>; 5])) -> Self {
         let chars = str.chars().collect::<Vec<char>>();
         let prefix = String::from_iter(&chars[tem[0].start..tem[4].start]);
         let filename = String::from_iter(&chars[tem[4].start..]);
-        Self { filename, prefix }
+        Self {
+            filename,
+            raw: prefix,
+        }
     }
 }
 
 #[derive(Default, Boxed)]
 struct FileListLB {
-    inner: Vec<FileLB>,
+    inner: Vec<FileLine>,
     header_line: Option<String>,
     begin_line: Option<String>,
     end_line: Option<String>,
     template: Option<[Range<usize>; 5]>,
     summary_line: String,
     capture: bool,
+    extract_path: String,
 }
 
 impl FileListLB {
@@ -259,11 +271,17 @@ impl LineBuilder for FileListLB {
                 self.summary_line = str.to_string();
             } else {
                 self.inner
-                    .push(FileLB::from((str, self.template.as_ref().unwrap())));
+                    .push(FileLine::from((str, self.template.as_ref().unwrap())));
             }
             true
         } else if str.contains("Attr") {
             self.header_line = Some(str.to_string());
+            true
+        } else if str.starts_with("Set extract_path:") {
+            self.extract_path = str
+                .trim_start_matches("Set extract_path:")
+                .trim()
+                .to_string();
             true
         } else {
             false
@@ -271,7 +289,11 @@ impl LineBuilder for FileListLB {
     }
 
     fn output(&self) -> Vec<String> {
-        let files = self.inner.iter().map(String::from).collect();
+        let files = self
+            .inner
+            .iter()
+            .map(|f| f.to_string(&self.extract_path))
+            .collect();
         [
             self.header_line.clone().map_or(vec![], |l| vec![l]),
             self.begin_line.clone().map_or(vec![], |l| vec![l]),
@@ -395,6 +417,8 @@ impl LineBuilder for ErrorLB {
 #[cfg(test)]
 mod test {
 
+    use std::env;
+
     use super::{parse_dash_line_to_range, FileListLB, LineBuilder};
     #[test]
     fn test_parse_dash_line_to_range() {
@@ -448,5 +472,26 @@ mod test {
         a.files().iter().for_each(|f| {
             println!("{}", f);
         });
+    }
+
+    #[test]
+    fn test_path() {
+        let mut path = env::current_dir().expect("cwd failed");
+        path.push("test.7z");
+        dbg!(&path);
+        dbg!(path.is_absolute());
+        dbg!(path.is_relative());
+        let mut path = env::current_dir().expect("cwd failed");
+        path.push("/home/kamo-death/code/vui-7z/stderr.txt");
+        dbg!(&path);
+        dbg!(path.is_absolute());
+        dbg!(path.is_relative());
+        let mut path = env::current_dir().expect("cwd failed");
+        path.push("$HOME/code/vui-7z/stderr.txt");
+        dbg!(&path);
+        dbg!(path.is_absolute());
+        dbg!(path.is_relative());
+        // let str = fs::read_to_string(path).unwrap();
+        // dbg!(str);
     }
 }
