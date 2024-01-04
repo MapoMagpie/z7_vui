@@ -27,7 +27,9 @@ use crate::{
 pub enum Pushment {
     // the option is (col, row), for nvim cursor
     Full(Vec<String>, Option<(usize, usize)>),
+    #[allow(dead_code)]
     Line(u64, String),
+    #[allow(dead_code)]
     None,
 }
 
@@ -96,19 +98,12 @@ impl Z7 {
         oper_sender: mpsc::Sender<Operation>,
     ) -> tokio::io::Result<()> {
         let (cmd_sender, cmd_recv) = mpsc::channel::<Cmd>(1);
-        let (opt_sender, opt_recv) = mpsc::channel::<Option<String>>(1);
+        // (line, from stdout:1 or stderr:2)
+        let (opt_sender, opt_recv) = mpsc::channel::<Option<(String, usize)>>(1);
         // begin to execute 'list' command first, then output will push to nvim
         cmd_sender.send(Cmd::List).await.expect("cmd sender error");
 
-        // let doc_sender = self.doc_sender.clone();
         let doc_sender_wait_close = self.doc_sender.clone();
-        // let selected_password = self.selected_password.clone();
-
-        // let stdin_pipe = self.stdin_pipe.clone();
-        // let password = self.password.clone();
-        // let doc_for_cmd = self.document.clone();
-        // let doc_for_read = self.document.clone();
-        // let status = self.execute_status.clone();
 
         let wait_doc_sender_closed = async move {
             doc_sender_wait_close.closed().await;
@@ -217,7 +212,7 @@ impl Z7 {
     async fn executing_cmd(
         &mut self,
         mut cmd_recv: mpsc::Receiver<Cmd>,
-        opt_sender: mpsc::Sender<Option<String>>,
+        opt_sender: mpsc::Sender<Option<(String, usize)>>,
     ) -> tokio::io::Result<()> {
         while let Some(cmd) = cmd_recv.recv().await {
             info!("recv cmd : {:?}", cmd);
@@ -257,14 +252,13 @@ impl Z7 {
             {
                 let mut status = self.execute_status.write().await;
                 if exit_status.success() {
-                    {
-                        if let Some(pwd) = self.password.read().await.clone() {
-                            let mut doc = self.document.write().await;
-                            doc.input(format!("Save password: {}", pwd).as_str());
-                        }
+                    if let Some(pwd) = self.password.read().await.clone() {
+                        let mut doc = self.document.write().await;
+                        doc.input(format!("Save password: {}", pwd).as_str());
                     }
                     *status = ExecuteStatus::None;
                 } else {
+                    self.password.write().await.take();
                     *status = match cmd {
                         Cmd::List => ExecuteStatus::List(exit_status),
                         Cmd::Extract => ExecuteStatus::Extract(exit_status),
@@ -280,13 +274,13 @@ impl Z7 {
     /// then push document to nvim through doc_sender
     async fn read_document(
         &mut self,
-        mut opt_recv: mpsc::Receiver<Option<String>>,
+        mut opt_recv: mpsc::Receiver<Option<(String, usize)>>,
         oper_sender: mpsc::Sender<Operation>,
     ) -> tokio::io::Result<()> {
         while let Some(line) = opt_recv.recv().await {
             match line {
-                Some(line) => {
-                    info!("recv output: {}", line);
+                Some((line, fd)) => {
+                    info!("recv output: {},{}", fd, line);
                     {
                         let mut doc = self.document.write().await;
                         doc.input(line.as_str());
@@ -364,7 +358,7 @@ where
 }
 
 async fn execute_cmd<I>(
-    opt_sender: mpsc::Sender<Option<String>>,
+    opt_sender: mpsc::Sender<Option<(String, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     args: I,
 ) -> tokio::io::Result<ExitStatus>
@@ -390,7 +384,7 @@ where
 
 async fn execute_list(
     filename: &str,
-    opt_sender: mpsc::Sender<Option<String>>,
+    opt_sender: mpsc::Sender<Option<(String, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Arc<RwLock<Option<String>>>,
 ) -> tokio::io::Result<ExitStatus> {
@@ -405,7 +399,7 @@ async fn execute_list(
 
 async fn execute_extract(
     filename: &str,
-    opt_sender: mpsc::Sender<Option<String>>,
+    opt_sender: mpsc::Sender<Option<(String, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Arc<RwLock<Option<String>>>,
 ) -> tokio::io::Result<ExitStatus> {
@@ -421,7 +415,7 @@ async fn execute_extract(
 async fn read_output<O, E>(
     stdout: O,
     stderr: E,
-    opt_sender: mpsc::Sender<Option<String>>,
+    opt_sender: mpsc::Sender<Option<(String, usize)>>,
 ) -> tokio::io::Result<()>
 where
     O: AsyncReadExt + Unpin,
@@ -436,7 +430,7 @@ where
                 // 'LF'
                 if c == 0x0a {
                     opt_sender
-                        .send(Some(str[from].clone()))
+                        .send(Some((str[from].clone(), from + 1)))
                         .await
                         .expect("send string line error");
                     str[from].clear();
@@ -449,7 +443,7 @@ where
                 else if c == 0x3a && str[from].starts_with("Enter password") {
                     str[from].push(c as char);
                     opt_sender
-                        .send(Some(str[from].clone()))
+                        .send(Some((str[from].clone(), from + 1)))
                         .await
                         .expect("send string line error");
                     str[from].clear();

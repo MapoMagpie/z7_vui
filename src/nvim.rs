@@ -102,7 +102,6 @@ impl Handler for NeovimHandler {
             }
             "nvim_execute_event" => {
                 // info!("handle_notify: name: {}, args: {:?}", name, args);
-                // nvim.quit_no_save().await.expect("quit nvim error");
                 let _ = self.oper_sender.try_send(Operation::Execute);
             }
             "nvim_select_password_event" => {
@@ -116,13 +115,7 @@ impl Handler for NeovimHandler {
             }
             "nvim_retry_event" => {
                 // info!("handle_notify: name: {}, args: {:?}", name, args);
-                // nvim.quit_no_save().await.expect("quit nvim error");
                 let _ = self.oper_sender.try_send(Operation::Retry);
-            }
-            "nvim_vim_leave_event" => {
-                // let _ = self.oper_sender.send(Operation::Execute).await;
-                self.oper_sender.closed().await;
-                info!("handle_notify: name: {}, args: {:?}", name, args);
             }
             _ => {
                 info!("handle_notify: name: {}, args: {:?}", name, args);
@@ -251,17 +244,6 @@ impl Nvim {
         )
         .await?;
         nvim.subscribe("nvim_insert_leave_event").await?;
-
-        // register "nvim_vim_leave_event", then subscribe it
-        nvim.create_autocmd(
-            Value::Array(vec!["VimLeave".into()]),
-            vec![(
-                "command".into(),
-                Value::String(r#"call rpcnotify(0, "nvim_vim_leave_event")"#.into()),
-            )],
-        )
-        .await?;
-        nvim.subscribe("nvim_vim_leave_event").await?;
 
         // register keymap "<space>c" to nvim, then nvim will notify "nvim_execute_event" to handler
         nvim.set_keymap(

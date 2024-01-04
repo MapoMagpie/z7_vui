@@ -1,6 +1,7 @@
 use std::{fs, ops::Range};
 
 use boxed_macro::Boxed;
+use log::error;
 
 pub struct Document {
     lbs: Lines,
@@ -21,6 +22,7 @@ impl Document {
         lines
     }
 
+    #[allow(dead_code)]
     pub fn files(&self) -> Vec<String> {
         self.lbs.file_list_lb.files()
     }
@@ -192,9 +194,10 @@ impl LineBuilder for PasswordLB {
         } else if str.starts_with("Input password") {
             let password = str.trim_start_matches("Input password: ");
             self.inner[0] = format!("Enter password: {}", password);
-            // self.password_history.push(password.to_string());
             true
         } else if str.starts_with("Save password") && self.inner.len() >= 2 {
+            self.password_history
+                .push(str.trim_start_matches("Save password: ").to_string());
             self.password_history.sort();
             self.password_history.dedup();
             fs::write(
@@ -226,6 +229,9 @@ impl FileLine {
 impl From<(&str, &[Range<usize>; 5])> for FileLine {
     fn from((str, tem): (&str, &[Range<usize>; 5])) -> Self {
         let chars = str.chars().collect::<Vec<char>>();
+        if chars.len() < tem[0].start || chars.len() < tem[4].start {
+            error!("parse file line failed: {}", str);
+        }
         let prefix = String::from_iter(&chars[tem[0].start..tem[4].start]);
         let filename = String::from_iter(&chars[tem[4].start..]);
         Self {
@@ -269,6 +275,8 @@ impl LineBuilder for FileListLB {
             if self.end_line.is_some() {
                 self.capture = false;
                 self.summary_line = str.to_string();
+            } else if str.is_empty() {
+                error!("occurs empty line in file list");
             } else {
                 self.inner
                     .push(FileLine::from((str, self.template.as_ref().unwrap())));
