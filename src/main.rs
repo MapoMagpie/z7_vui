@@ -15,7 +15,7 @@ async fn main() {
     log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
     let (doc_sender, doc_recv) = mpsc::channel::<Pushment>(1);
     let (oper_sender, oper_recv) = mpsc::channel::<Operation>(1);
-    let mut z7 = Z7::new(doc_sender, opt);
+    let mut z7 = Z7::new(doc_sender, &opt);
     let _ = try_join!(
         z7.start(oper_recv, oper_sender.clone()),
         Nvim::start(doc_recv, oper_sender)

@@ -13,10 +13,7 @@ use nvim_rs::{
 use parity_tokio_ipc::Connection;
 use tokio::{io::WriteHalf, process::Command, sync::mpsc, time::sleep, try_join};
 
-use crate::{
-    output_format::PASSWORD_LINE,
-    z7::{Operation, Pushment},
-};
+use crate::z7::{Operation, Pushment};
 
 // const OUTPUT_FILE: &str = "handler_drop.txt";
 const NVIMPATH: &str = "nvim";
@@ -68,6 +65,22 @@ impl NeovimHandler {
     }
 }
 
+struct CursorAt {
+    col: i64,
+    #[allow(dead_code)]
+    row: i64,
+}
+
+// [Array([String(Utf8String { s: Ok("n") }), Array([Integer(PosInt(1)), Integer(PosInt(0))])])]
+impl From<Vec<Value>> for CursorAt {
+    fn from(args: Vec<Value>) -> Self {
+        let args = args[0].as_array().unwrap()[1].as_array().unwrap();
+        let col = args[0].as_i64().unwrap();
+        let row = args[1].as_i64().unwrap();
+        Self { col, row }
+    }
+}
+
 #[async_trait]
 impl Handler for NeovimHandler {
     // type Writer = Compat<WriteHalf<Connection>>;
@@ -86,17 +99,27 @@ impl Handler for NeovimHandler {
                 // info!("handle_notify: name: {}, args: {:?}", name, args);
                 // find password from buf line, then send password to 7z
                 let buf = nvim.get_current_buf().await.expect("get current buf error");
-                let pwd_line = PASSWORD_LINE as i64;
+                let cursor = CursorAt::from(args);
                 let lines = buf
-                    .get_lines(pwd_line - 1, pwd_line + 1, false)
+                    .get_lines((cursor.col - 1).min(0), cursor.col + 1, false)
                     .await
                     .expect("get lines error");
-                let pwd = lines.iter().find(|l| l.starts_with("Enter password: "));
-                if let Some(pwd) = pwd {
-                    let pwd = pwd.trim_start_matches("Enter password:").to_string();
-                    let pwd = pwd.trim().to_string();
-                    if !pwd.is_empty() {
-                        let _ = self.oper_sender.try_send(Operation::Password(pwd));
+                for line in lines.into_iter() {
+                    if line.starts_with("Enter password: ") {
+                        let pwd = line.clone();
+                        let pwd = pwd.trim_start_matches("Enter password:").trim().to_string();
+                        if !pwd.is_empty() {
+                            let _ = self.oper_sender.try_send(Operation::Password(pwd));
+                        }
+                        break;
+                    }
+                    if line.starts_with("Extract to: ") {
+                        let path = line.clone();
+                        let path = path.trim_start_matches("Extract to: ").trim().to_string();
+                        if !path.is_empty() {
+                            let _ = self.oper_sender.try_send(Operation::ExtractTo(path));
+                        }
+                        break;
                     }
                 }
             }
@@ -195,9 +218,10 @@ impl Nvim {
                                 .expect("start insert error");
                         }
                     }
-                    Pushment::Line(_line, _content) => {
-                        unreachable!()
-                    }
+                    Pushment::Line(line, content) => curbuf
+                        .set_lines(line as i64, line as i64, false, vec![content])
+                        .await
+                        .expect("set lines error"),
                     Pushment::None => {
                         nvim.quit_no_save().await.expect("quit nvim error");
                     }

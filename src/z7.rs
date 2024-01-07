@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
     io::ErrorKind,
+    path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
     vec,
@@ -37,6 +38,7 @@ pub enum Pushment {
 pub enum Operation {
     Password(String),
     SelectPassword(String),
+    ExtractTo(String),
     Execute,
     Retry,
 }
@@ -62,7 +64,9 @@ pub struct Z7 {
     selected_password: Arc<RwLock<Option<String>>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     execute_status: Arc<RwLock<ExecuteStatus>>,
-    options: Arc<RwLock<Options>>,
+    file: String,
+    extract_to_path: Arc<RwLock<PathBuf>>,
+    password_history_file: String,
 }
 
 impl Clone for Z7 {
@@ -74,13 +78,18 @@ impl Clone for Z7 {
             selected_password: self.selected_password.clone(),
             stdin_pipe: self.stdin_pipe.clone(),
             execute_status: self.execute_status.clone(),
-            options: self.options.clone(),
+            file: self.file.clone(),
+            extract_to_path: self.extract_to_path.clone(),
+            password_history_file: self.password_history_file.clone(),
         }
     }
 }
 
 impl Z7 {
-    pub fn new(pusher: mpsc::Sender<Pushment>, opt: Options) -> Self {
+    pub fn new(pusher: mpsc::Sender<Pushment>, opt: &Options) -> Self {
+        let file = opt.file.file.clone();
+        let extract_to_path = PathBuf::from(PathBuf::from(&file).parent().unwrap());
+        let password_history_file = opt.password_history_file.clone();
         Self {
             document: Arc::new(RwLock::new(Document::new())),
             doc_sender: pusher,
@@ -88,7 +97,9 @@ impl Z7 {
             selected_password: Arc::new(RwLock::new(None)),
             stdin_pipe: Arc::new(RwLock::new(None)),
             execute_status: Arc::new(RwLock::new(ExecuteStatus::None)),
-            options: Arc::new(RwLock::new(opt)),
+            file,
+            extract_to_path: Arc::new(RwLock::new(extract_to_path)),
+            password_history_file,
         }
     }
 
@@ -142,6 +153,9 @@ impl Z7 {
                     }
                     let _ = cmd_sender.try_send(Cmd::List);
                 }
+                Operation::ExtractTo(path) => {
+                    self.set_extract_to_path(&path).await;
+                }
                 Operation::Password(pwd) => {
                     self.write_password(&pwd).await;
                 }
@@ -172,6 +186,13 @@ impl Z7 {
         Ok(())
     }
 
+    async fn set_extract_to_path(&mut self, path: &str) {
+        let mut extract_to_path = self.extract_to_path.write().await;
+        *extract_to_path = PathBuf::from(path);
+        let input = format!("Extract to: {}", extract_to_path.to_str().unwrap());
+        let mut doc = self.document.write().await;
+        doc.input(&input);
+    }
     /// write password to child stdin,
     /// then child will continue to execute with output
     async fn write_password(&mut self, pwd: &str) {
@@ -209,22 +230,27 @@ impl Z7 {
             info!("recv cmd : {:?}", cmd);
             let opt_sender = opt_sender.clone();
             let stdin_pipe = self.stdin_pipe.clone();
-            let password = self.password.clone();
             {
-                info!("set status to pedding start");
                 let mut status = self.execute_status.write().await;
                 *status = ExecuteStatus::Pedding;
-                info!("set status to pedding end");
             }
+            let password = {
+                let password = self.password.read().await;
+                password.clone()
+            };
             let (exit_status, cmd) = match cmd {
                 Cmd::List => {
                     {
                         let mut doc = self.document.write().await;
                         doc.layout_list();
+                        doc.input(format!("Extract file: {}", self.file).as_str());
+                        let extract_to_path = self.extract_to_path.read().await;
+                        doc.input(
+                            format!("Extract to: {}", extract_to_path.to_str().unwrap()).as_str(),
+                        );
                     }
-                    let file = { self.options.read().await.file.clone() };
                     (
-                        execute_list(&file, opt_sender, stdin_pipe, password).await?,
+                        execute_list(&self.file, opt_sender, stdin_pipe, password).await?,
                         Cmd::List,
                     )
                 }
@@ -233,9 +259,19 @@ impl Z7 {
                         let mut doc = self.document.write().await;
                         doc.layout_extract();
                     }
-                    let file = { self.options.read().await.file.clone() };
+                    let extract_to_path = {
+                        let extract_to_path = self.extract_to_path.read().await;
+                        extract_to_path.to_str().unwrap().to_string()
+                    };
                     (
-                        execute_extract(&file, opt_sender, stdin_pipe, password).await?,
+                        execute_extract(
+                            &self.file,
+                            opt_sender,
+                            stdin_pipe,
+                            password,
+                            &extract_to_path,
+                        )
+                        .await?,
                         Cmd::Extract,
                     )
                 }
@@ -243,11 +279,27 @@ impl Z7 {
             {
                 let mut status = self.execute_status.write().await;
                 if exit_status.success() {
+                    *status = ExecuteStatus::None;
+                    let mut doc = self.document.write().await;
                     if let Some(pwd) = self.password.read().await.clone() {
-                        let mut doc = self.document.write().await;
                         doc.input(format!("Save password: {}", pwd).as_str());
                     }
-                    *status = ExecuteStatus::None;
+                    match cmd {
+                        Cmd::List if check_same_directory(&doc.files()).is_none() => {
+                            let filename = PathBuf::from(&self.file);
+                            let filename = filename.file_stem().unwrap();
+                            let mut extract_to_path = self.extract_to_path.write().await;
+                            extract_to_path.push(filename);
+                            let input =
+                                format!("Extract to: {}", extract_to_path.to_str().unwrap());
+                            doc.input(&input);
+                            self.doc_sender
+                                .send(Pushment::Line(4, input))
+                                .await
+                                .expect("send string line error");
+                        }
+                        _ => {}
+                    }
                 } else {
                     self.password.write().await.take();
                     *status = match cmd {
@@ -280,10 +332,8 @@ impl Z7 {
                         {
                             let mut doc = self.document.write().await;
                             doc.input(
-                                format!("Password history file: {}", {
-                                    self.options.read().await.password_history_file.clone()
-                                })
-                                .as_str(),
+                                format!("Password history file: {}", self.password_history_file)
+                                    .as_str(),
                             );
                         }
                         let lines = {
@@ -377,11 +427,10 @@ async fn execute_list(
     filename: &str,
     opt_sender: mpsc::Sender<Option<(String, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
-    password: Arc<RwLock<Option<String>>>,
+    password: Option<String>,
 ) -> tokio::io::Result<ExitStatus> {
     let mut args = vec!["l", filename];
-    let pwd = { password.read().await.clone() };
-    let pwd = pwd.map(|s| format!("-p{}", s));
+    let pwd = password.map(|s| format!("-p{}", s));
     if let Some(w) = pwd.as_ref() {
         args.push(w);
     }
@@ -392,11 +441,12 @@ async fn execute_extract(
     filename: &str,
     opt_sender: mpsc::Sender<Option<(String, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
-    password: Arc<RwLock<Option<String>>>,
+    password: Option<String>,
+    extract_to_path: &str,
 ) -> tokio::io::Result<ExitStatus> {
-    let mut args = vec!["x", filename, "-y"];
-    let pwd = { password.read().await.clone() };
-    let pwd = pwd.map(|s| format!("-p{}", s));
+    let out = format!("-o{}", extract_to_path);
+    let mut args = vec!["x", filename, "-y", &out];
+    let pwd = password.map(|s| format!("-p{}", s));
     if let Some(w) = pwd.as_ref() {
         args.push(w);
     }
@@ -496,5 +546,88 @@ where
                 }
             }
         }
+    }
+}
+
+pub fn check_same_directory(files: &[String]) -> Option<String> {
+    let mut prefix = String::new();
+    let mut iter = files.iter();
+    if let Some(first) = iter.next() {
+        prefix.push_str(first);
+        prefix.push('/');
+        for file in iter {
+            let mut i = 0;
+            for (a, b) in prefix
+                .chars()
+                .zip(file.chars().chain(std::iter::repeat('/')))
+            {
+                if a != b {
+                    break;
+                } else if a == '/' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prefix.truncate(i);
+        }
+    }
+    if prefix.is_empty() || !prefix.ends_with('/') {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::check_same_directory;
+
+    #[test]
+    fn test_path_parent() {
+        let path = std::path::PathBuf::from("/home/chen/code/vui-7z/src");
+        let parent = path.parent().unwrap();
+        assert_eq!(parent, std::path::PathBuf::from("/home/chen/code/vui-7z"));
+        let path = std::path::PathBuf::from("code/vui-7z/src");
+        let parent = path.parent().unwrap();
+        assert_eq!(parent, std::path::PathBuf::from("code/vui-7z"));
+    }
+
+    #[test]
+    fn test_path_display() {
+        let path = std::path::PathBuf::from("");
+        assert_ne!(format!("{:?}", path), "");
+        assert_eq!(path.to_str().unwrap(), "");
+        let path = std::path::PathBuf::from("/home/chen/code/vui-7z/src");
+        assert_ne!(format!("{:?}", path), "/home/chen/code/vui-7z/src");
+        assert_eq!(path.to_str().unwrap(), "/home/chen/code/vui-7z/src");
+    }
+
+    #[test]
+    fn test_check_same_prefix() {
+        let files = ["test/03-e_03.png", "test/01-e_01.png"];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(prefix, Some("test/".to_string()));
+
+        let files = ["03-e_03.png", "01-e_01.png"];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(prefix, None);
+
+        let files = ["test", "test/01-e_01.png"];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(prefix, Some("test/".to_string()));
+
+        let files = ["test2/01-e_01.png", "test/01-e_01.png"];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(prefix, None);
+
+        let files = ["test", "test2"];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(prefix, None);
     }
 }

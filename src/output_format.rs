@@ -17,9 +17,7 @@ impl Document {
     }
 
     pub fn output(&self) -> Vec<String> {
-        let mut lines = self.lbs.lines();
-        lines.dedup();
-        lines
+        self.lbs.lines()
     }
 
     #[allow(dead_code)]
@@ -28,57 +26,49 @@ impl Document {
     }
 
     pub fn layout_list(&mut self) {
-        let mut lbs = Lines::new_list();
-        std::mem::swap(&mut self.lbs, &mut lbs);
-        self.lbs.file_list_lb = lbs.file_list_lb;
+        self.lbs.new_list();
     }
 
     pub fn layout_extract(&mut self) {
-        let mut lbs = Lines::new_extract();
-        std::mem::swap(&mut self.lbs, &mut lbs);
-        self.lbs.file_list_lb = lbs.file_list_lb;
+        self.lbs.new_extract();
     }
 }
 
 pub struct Lines {
+    title_lb: TitleLB,
+    filename_lb: FilenameLB,
+    extract_to_lb: ExtractToLB,
     inner: Vec<Box<dyn LineBuilder>>,
     file_list_lb: FileListLB,
 }
 
-pub const PASSWORD_LINE: usize = 6;
+pub const PASSWORD_LINE: usize = 8;
 impl Lines {
     fn new() -> Self {
         Self {
+            title_lb: TitleLB::default(),
+            filename_lb: FilenameLB::default(),
+            extract_to_lb: ExtractToLB::default(),
             inner: vec![],
             file_list_lb: FileListLB::default(),
         }
     }
-    fn new_list() -> Self {
+    fn new_list(&mut self) {
         let inner = vec![
-            TitleLB::boxed(),
-            EmptyLB::boxed(),
-            CaptureLB::new_boxed("Listing archive:"), // file name
-            CaptureLB::new_boxed("file,"),            // file size
+            CaptureLB::new_boxed("file,"), // file size
             EmptyLB::boxed(),
             PasswordLB::boxed(),
             EmptyLB::boxed(),
             PropertyLB::boxed(),
             EmptyLB::boxed(),
             ErrorLB::boxed(),
-            EmptyLB::boxed(),
         ];
-        Self {
-            inner,
-            file_list_lb: FileListLB::default(),
-        }
+        self.inner = inner;
     }
 
-    fn new_extract() -> Self {
+    fn new_extract(&mut self) {
         let inner = vec![
-            TitleLB::boxed(),
-            EmptyLB::boxed(),
-            CaptureLB::new_boxed("Extracting archive:"), // file name
-            CaptureLB::new_boxed("file,"),               // file size
+            CaptureLB::new_boxed("file,"), // file size
             EmptyLB::boxed(),
             PasswordLB::boxed(),
             EmptyLB::boxed(),
@@ -86,16 +76,18 @@ impl Lines {
             EmptyLB::boxed(),
             CaptureLB::new_boxed("Everything"), // file name
             ErrorLB::boxed(),
-            EmptyLB::boxed(),
         ];
-        Self {
-            inner,
-            file_list_lb: FileListLB::default(),
-        }
+        self.inner = inner;
     }
 
     fn input(&mut self, input: &str) {
         if self.file_list_lb.input(input) {
+            return;
+        }
+        if self.filename_lb.input(input) {
+            return;
+        }
+        if self.extract_to_lb.input(input) {
             return;
         }
         for lb in self.inner.iter_mut() {
@@ -106,8 +98,19 @@ impl Lines {
     }
 
     fn lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self.inner.iter().flat_map(|lb| lb.output()).collect();
-        lines.append(&mut self.file_list_lb.output());
+        let empty_lb = EmptyLB;
+        let mut lines = [
+            self.title_lb.output(),
+            empty_lb.output(),
+            self.filename_lb.output(),
+            self.extract_to_lb.output(),
+            empty_lb.output(),
+            self.inner.iter().flat_map(|lb| lb.output()).collect(),
+            empty_lb.output(),
+            self.file_list_lb.output(),
+        ]
+        .concat();
+        lines.dedup();
         lines
     }
 }
@@ -140,6 +143,52 @@ impl Default for TitleLB {
 }
 
 impl LineBuilder for TitleLB {
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
+    }
+}
+
+#[derive(Default, Boxed)]
+struct FilenameLB {
+    inner: String,
+    done: bool,
+}
+
+impl LineBuilder for FilenameLB {
+    fn input(&mut self, input: &str) -> bool {
+        if self.done {
+            false
+        } else if input.starts_with("Extract file: ") || input.starts_with("Add file: ") {
+            self.inner = input.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn output(&self) -> Vec<String> {
+        vec![self.inner.clone()]
+    }
+}
+
+#[derive(Default, Boxed)]
+struct ExtractToLB {
+    inner: String,
+    done: bool,
+}
+
+impl LineBuilder for ExtractToLB {
+    fn input(&mut self, input: &str) -> bool {
+        if self.done {
+            false
+        } else if input.starts_with("Extract to: ") {
+            self.inner = input.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     fn output(&self) -> Vec<String> {
         vec![self.inner.clone()]
     }
@@ -425,7 +474,7 @@ impl LineBuilder for ErrorLB {
 #[cfg(test)]
 mod test {
 
-    use std::env;
+    use std::path::PathBuf;
 
     use super::{parse_dash_line_to_range, FileListLB, LineBuilder};
     #[test]
@@ -484,22 +533,25 @@ mod test {
 
     #[test]
     fn test_path() {
-        let mut path = env::current_dir().expect("cwd failed");
+        // let path = env::current_dir().expect("cwd failed");
+        // dbg!(path.to_str());
+        let mut path = PathBuf::from("/home/someone/download");
         path.push("test.7z");
-        dbg!(&path);
-        dbg!(path.is_absolute());
-        dbg!(path.is_relative());
-        let mut path = env::current_dir().expect("cwd failed");
-        path.push("/home/kamo-death/code/vui-7z/stderr.txt");
-        dbg!(&path);
-        dbg!(path.is_absolute());
-        dbg!(path.is_relative());
-        let mut path = env::current_dir().expect("cwd failed");
-        path.push("$HOME/code/vui-7z/stderr.txt");
-        dbg!(&path);
-        dbg!(path.is_absolute());
-        dbg!(path.is_relative());
-        // let str = fs::read_to_string(path).unwrap();
-        // dbg!(str);
+        assert_eq!(path.to_str().unwrap(), "/home/someone/download/test.7z");
+
+        let mut path = PathBuf::from("/home/someone/download");
+        path.push("/home/someone/download/stderr.txt");
+        assert_eq!(path.to_str().unwrap(), "/home/someone/download/stderr.txt");
+
+        let mut path = PathBuf::from("/home/someone/download");
+        path.push("/home/sometwo/download/stderr.txt");
+        assert_eq!(path.to_str().unwrap(), "/home/sometwo/download/stderr.txt");
+
+        let mut path = PathBuf::from("/home/someone/download");
+        path.push("sometwo/download/stderr.txt");
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/home/someone/download/sometwo/download/stderr.txt"
+        );
     }
 }
