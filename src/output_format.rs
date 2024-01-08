@@ -237,7 +237,11 @@ impl LineBuilder for PasswordLB {
                 }
                 self.inner.push(format!(
                     "select password use [Ctrl+x]: {}",
-                    self.password_history.join(" | ")
+                    self.password_history
+                        .iter()
+                        .map(|p| format!("[{p}]"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             return true;

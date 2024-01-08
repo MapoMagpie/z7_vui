@@ -302,7 +302,7 @@ impl Nvim {
         nvim.set_keymap(
             "n",
             "<space>x",
-            r#"yiw:call rpcnotify(0, "nvim_select_password_event", getreg(0))<CR>"#,
+            r#"yi]:call rpcnotify(0, "nvim_select_password_event", getreg(0))<CR>"#,
             vec![("silent".into(), true.into())],
         )
         .await?;
