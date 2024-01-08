@@ -207,6 +207,7 @@ impl LineBuilder for EmptyLB {
 struct PasswordLB {
     inner: Vec<String>,
     password_history: Vec<String>,
+    password_history_file: Option<String>,
 }
 
 impl LineBuilder for PasswordLB {
@@ -219,8 +220,12 @@ impl LineBuilder for PasswordLB {
         }
         if str.starts_with("Password history file: ") {
             // read password history from file config/password_history.txt
+            self.password_history_file = Some(
+                str.trim_start_matches("Password history file: ")
+                    .to_string(),
+            );
             if let Ok(password_history) =
-                fs::read_to_string(str.trim_start_matches("Password history file: "))
+                fs::read_to_string(self.password_history_file.as_ref().unwrap())
             {
                 self.password_history = password_history
                     .lines()
@@ -245,15 +250,14 @@ impl LineBuilder for PasswordLB {
             self.inner[0] = format!("Enter password: {}", password);
             true
         } else if str.starts_with("Save password") && self.inner.len() >= 2 {
-            self.password_history
-                .push(str.trim_start_matches("Save password: ").to_string());
-            self.password_history.sort();
-            self.password_history.dedup();
-            fs::write(
-                "config/password_history.txt",
-                self.password_history.join("\n"),
-            )
-            .expect("write password history failed");
+            if let Some(file) = &self.password_history_file {
+                self.password_history
+                    .push(str.trim_start_matches("Save password: ").to_string());
+                self.password_history.sort();
+                self.password_history.dedup();
+                fs::write(file, self.password_history.join("\n"))
+                    .expect("write password history failed");
+            }
             true
         } else {
             false

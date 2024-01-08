@@ -101,7 +101,7 @@ impl Handler for NeovimHandler {
                 let buf = nvim.get_current_buf().await.expect("get current buf error");
                 let cursor = CursorAt::from(args);
                 let lines = buf
-                    .get_lines((cursor.col - 1).min(0), cursor.col + 1, false)
+                    .get_lines((cursor.col - 1).max(0), cursor.col + 1, false)
                     .await
                     .expect("get lines error");
                 for line in lines.into_iter() {

@@ -3,6 +3,7 @@ use std::{
     io::ErrorKind,
     path::PathBuf,
     process::{ExitStatus, Stdio},
+    str::from_utf8,
     sync::Arc,
     vec,
 };
@@ -110,7 +111,7 @@ impl Z7 {
     ) -> tokio::io::Result<()> {
         let (cmd_sender, cmd_recv) = mpsc::channel::<Cmd>(1);
         // (line, from stdout:1 or stderr:2)
-        let (opt_sender, opt_recv) = mpsc::channel::<Option<(String, usize)>>(1);
+        let (opt_sender, opt_recv) = mpsc::channel::<Option<(Vec<u8>, usize)>>(1);
         // begin to execute 'list' command first, then output will push to nvim
         cmd_sender.send(Cmd::List).await.expect("cmd sender error");
 
@@ -224,7 +225,7 @@ impl Z7 {
     async fn executing_cmd(
         &mut self,
         mut cmd_recv: mpsc::Receiver<Cmd>,
-        opt_sender: mpsc::Sender<Option<(String, usize)>>,
+        opt_sender: mpsc::Sender<Option<(Vec<u8>, usize)>>,
     ) -> tokio::io::Result<()> {
         while let Some(cmd) = cmd_recv.recv().await {
             info!("recv cmd : {:?}", cmd);
@@ -317,16 +318,17 @@ impl Z7 {
     /// then push document to nvim through doc_sender
     async fn read_document(
         &mut self,
-        mut opt_recv: mpsc::Receiver<Option<(String, usize)>>,
+        mut opt_recv: mpsc::Receiver<Option<(Vec<u8>, usize)>>,
         oper_sender: mpsc::Sender<Operation>,
     ) -> tokio::io::Result<()> {
         while let Some(line) = opt_recv.recv().await {
             match line {
                 Some((line, fd)) => {
+                    let line = from_utf8(&line).expect("can not convert to utf8");
                     info!("recv output: {},{}", fd, line);
                     {
                         let mut doc = self.document.write().await;
-                        doc.input(line.as_str());
+                        doc.input(line);
                     }
                     if line.starts_with("Enter password") {
                         {
@@ -399,7 +401,7 @@ where
 }
 
 async fn execute_cmd<I>(
-    opt_sender: mpsc::Sender<Option<(String, usize)>>,
+    opt_sender: mpsc::Sender<Option<(Vec<u8>, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     args: I,
 ) -> tokio::io::Result<ExitStatus>
@@ -425,7 +427,7 @@ where
 
 async fn execute_list(
     filename: &str,
-    opt_sender: mpsc::Sender<Option<(String, usize)>>,
+    opt_sender: mpsc::Sender<Option<(Vec<u8>, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Option<String>,
 ) -> tokio::io::Result<ExitStatus> {
@@ -439,7 +441,7 @@ async fn execute_list(
 
 async fn execute_extract(
     filename: &str,
-    opt_sender: mpsc::Sender<Option<(String, usize)>>,
+    opt_sender: mpsc::Sender<Option<(Vec<u8>, usize)>>,
     stdin_pipe: Arc<RwLock<Option<ChildStdin>>>,
     password: Option<String>,
     extract_to_path: &str,
@@ -456,7 +458,7 @@ async fn execute_extract(
 async fn read_output<O, E>(
     stdout: O,
     stderr: E,
-    opt_sender: mpsc::Sender<Option<(String, usize)>>,
+    opt_sender: mpsc::Sender<Option<(Vec<u8>, usize)>>,
 ) -> tokio::io::Result<()>
 where
     O: AsyncReadExt + Unpin,
@@ -464,33 +466,32 @@ where
 {
     let mut reader = OutputReader::new(stdout, stderr);
     // stdout , stderr
-    let mut str = [String::new(), String::new()];
+    let mut bufs = [vec![], vec![]];
     loop {
         match reader.read().await {
             Ok((c, from)) => {
                 // 'LF'
                 if c == 0x0a {
+                    let buf = std::mem::take(&mut bufs[from]);
                     opt_sender
-                        .send(Some((str[from].clone(), from + 1)))
+                        .send(Some((buf, from + 1)))
                         .await
                         .expect("send string line error");
-                    str[from].clear();
                 }
                 // '\b' backspace, actually someone eat them
                 else if c == 0x08 {
                     info!("read output has backspace");
                 }
                 // ':'
-                else if c == 0x3a && str[from].starts_with("Enter password") {
-                    str[from].push(c as char);
+                else if c == 0x3a && bufs[from].starts_with("Enter password".as_bytes()) {
+                    bufs[from].push(c);
+                    let buf = std::mem::take(&mut bufs[from]);
                     opt_sender
-                        .send(Some((str[from].clone(), from + 1)))
+                        .send(Some((buf, from + 1)))
                         .await
                         .expect("send string line error");
-                    str[from].clear();
                 } else {
-                    str[from].push(c as char);
-                    // info!("read output: {}", str);
+                    bufs[from].push(c);
                 }
             }
             // EOF
@@ -558,12 +559,12 @@ pub fn check_same_directory(files: &[String]) -> Option<String> {
         for file in iter {
             let mut i = 0;
             for (a, b) in prefix
-                .chars()
-                .zip(file.chars().chain(std::iter::repeat('/')))
+                .bytes()
+                .zip(file.bytes().chain(std::iter::repeat(b'/')))
             {
                 if a != b {
                     break;
-                } else if a == '/' {
+                } else if a == b'/' {
                     i += 1;
                     break;
                 }
@@ -629,5 +630,21 @@ mod test {
         let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let prefix = check_same_directory(&files);
         assert_eq!(prefix, None);
+
+        let files = [
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0001.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0002.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0003.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0004.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0005.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0006.jpg",
+            "[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/0007.jpg",
+        ];
+        let files = files.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let prefix = check_same_directory(&files);
+        assert_eq!(
+            prefix,
+            Some("[陰謀の帝国 (印度カリー)] 蝶子系列 I_V/".to_string())
+        );
     }
 }

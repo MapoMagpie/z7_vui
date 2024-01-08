@@ -28,10 +28,10 @@ impl From<String> for FilePath {
 }
 
 fn default_password_history_file() -> String {
-    // let path = PathBuf::from(env!("HOME"))
-    //     .join(".config")
-    //     .join("7zvui")
-    //     .join("password_history.txt");
-    let path = PathBuf::from(env!("HOME")).join("code/vui-7z/config/password_history.txt");
+    let path = PathBuf::from(env!("HOME"))
+        .join(".config")
+        .join("7zvui")
+        .join("password_history.txt");
+    // let path = PathBuf::from(env!("HOME")).join("code/vui-7z/config/password_history.txt");
     path.to_str().unwrap().to_string()
 }
